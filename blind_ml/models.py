@@ -144,6 +144,218 @@ class NaiveBayesModel:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# GAUSSIAN NAIVE BAYES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class GaussianNaiveBayesModel:
+    """Gaussian Naive Bayes trained from class-conditional numeric summaries.
+
+    Each feature is modeled as normally distributed within each class using
+    ``count``, ``mean``, and population ``variance``. These summaries can come
+    from local plaintext data or encrypted aggregate queries.
+    """
+
+    def __init__(
+        self,
+        var_smoothing: float = 1e-9,
+        threshold: float = 0.5,
+    ) -> None:
+        self.var_smoothing = var_smoothing
+        self.threshold = threshold
+        self.P_pos: float = 0.5
+        self.P_neg: float = 0.5
+        self.stats: dict[str, dict[int, dict[str, float]]] = {}
+        self.feature_keys: list[str] = []
+        self.epsilon_: float = 1e-12
+        self.train_time: float = 0.0
+
+    def fit(
+        self,
+        gaussian_stats: list[tuple[str, int, int, float, float]],
+        n_pos: int | None = None,
+        n_neg: int | None = None,
+        global_variance: float | None = None,
+    ) -> GaussianNaiveBayesModel:
+        """Fit from class-conditional Gaussian summaries.
+
+        Parameters
+        ----------
+        gaussian_stats : list of (feature_key, class_label, count, mean, variance)
+            ``variance`` must be the population variance for that feature within
+            the class, matching sklearn's GaussianNB convention.
+        n_pos, n_neg : optional class totals. If omitted, inferred from summary
+            counts by taking the largest count seen for each class.
+        global_variance : optional maximum overall feature variance for sklearn-
+            style smoothing. If omitted, max class-conditional variance is used.
+        """
+        start = time.time()
+        if not gaussian_stats:
+            raise ValueError("gaussian_stats must contain at least one feature summary")
+
+        grouped: dict[str, dict[int, dict[str, float]]] = {}
+        inferred_counts = {1: 0, 0: 0}
+        max_class_variance = 0.0
+
+        for feature_key, class_label, count, mean, variance in gaussian_stats:
+            cls = int(class_label)
+            if cls not in (0, 1):
+                raise ValueError("GaussianNaiveBayesModel supports binary class labels 0 and 1")
+            n = int(count)
+            var = max(float(variance), 0.0)
+            grouped.setdefault(feature_key, {})[cls] = {
+                "count": float(n),
+                "mean": float(mean),
+                "var": var,
+            }
+            inferred_counts[cls] = max(inferred_counts[cls], n)
+            max_class_variance = max(max_class_variance, var)
+
+        if n_pos is None:
+            n_pos = inferred_counts[1]
+        if n_neg is None:
+            n_neg = inferred_counts[0]
+
+        n_total = int(n_pos) + int(n_neg)
+        self.P_pos = int(n_pos) / n_total if n_total > 0 else 0.5
+        self.P_neg = int(n_neg) / n_total if n_total > 0 else 0.5
+
+        smoothing_source = max(float(global_variance or 0.0), max_class_variance)
+        self.epsilon_ = max(self.var_smoothing * smoothing_source, 1e-12)
+        self.feature_keys = sorted(grouped.keys())
+        self.stats = {feature_key: {} for feature_key in self.feature_keys}
+
+        for feature_key in self.feature_keys:
+            for cls in (0, 1):
+                if cls not in grouped[feature_key]:
+                    continue
+                class_stats = grouped[feature_key][cls]
+                self.stats[feature_key][cls] = {
+                    "count": class_stats["count"],
+                    "mean": class_stats["mean"],
+                    "var": max(class_stats["var"] + self.epsilon_, 1e-12),
+                }
+
+        self.train_time = time.time() - start
+        return self
+
+    def fit_dataframe(
+        self,
+        df: pd.DataFrame,
+        feature_columns: list[str],
+        target_col: str,
+    ) -> GaussianNaiveBayesModel:
+        """Fit from a plaintext DataFrame of numeric features."""
+        if not feature_columns:
+            raise ValueError("feature_columns must contain at least one feature")
+
+        X = df[feature_columns].apply(pd.to_numeric, errors="coerce")
+        if X.isnull().any().any():
+            bad_cols = X.columns[X.isnull().any()].tolist()
+            raise ValueError(f"GaussianNaiveBayesModel requires numeric, non-null features: {bad_cols}")
+
+        y = df[target_col].astype(int)
+        if not set(y.unique()).issubset({0, 1}):
+            raise ValueError("GaussianNaiveBayesModel requires binary target labels 0 and 1")
+
+        n_pos = int((y == 1).sum())
+        n_neg = int((y == 0).sum())
+        global_variance = float(np.var(X.values.astype(np.float64), axis=0).max())
+
+        summaries: list[tuple[str, int, int, float, float]] = []
+        for feature_key in feature_columns:
+            values = X[feature_key].values.astype(np.float64)
+            for cls in (1, 0):
+                class_values = values[(y == cls).values]
+                count = len(class_values)
+                mean = float(class_values.mean()) if count else 0.0
+                variance = float(class_values.var()) if count else 0.0
+                summaries.append((feature_key, cls, count, mean, variance))
+
+        return self.fit(summaries, n_pos=n_pos, n_neg=n_neg, global_variance=global_variance)
+
+    def fit_from_sums(
+        self,
+        sufficient_stats: list[tuple[str, int, int, float, float]],
+        n_pos: int | None = None,
+        n_neg: int | None = None,
+    ) -> GaussianNaiveBayesModel:
+        """Fit from (feature_key, class_label, count, sum, sum_of_squares)."""
+        summaries: list[tuple[str, int, int, float, float]] = []
+        feature_totals: dict[str, dict[str, float]] = {}
+
+        for feature_key, class_label, count, value_sum, squared_sum in sufficient_stats:
+            n = int(count)
+            if n > 0:
+                mean = float(value_sum) / n
+                variance = max(float(squared_sum) / n - mean * mean, 0.0)
+            else:
+                mean = 0.0
+                variance = 0.0
+            totals = feature_totals.setdefault(feature_key, {"count": 0.0, "sum": 0.0, "sum_sq": 0.0})
+            totals["count"] += n
+            totals["sum"] += float(value_sum)
+            totals["sum_sq"] += float(squared_sum)
+            summaries.append((feature_key, int(class_label), n, mean, variance))
+
+        global_variance = 0.0
+        for totals in feature_totals.values():
+            n = totals["count"]
+            if n > 0:
+                mean = totals["sum"] / n
+                global_variance = max(global_variance, max(totals["sum_sq"] / n - mean * mean, 0.0))
+
+        return self.fit(summaries, n_pos=n_pos, n_neg=n_neg, global_variance=global_variance)
+
+    def predict(self, row_features: dict[str, Any]) -> tuple[int, float]:
+        """Return (predicted_class, posterior_risk) for one numeric row."""
+        eps = 1e-12
+        log_pos = math.log(self.P_pos + eps)
+        log_neg = math.log(self.P_neg + eps)
+
+        for feature_key in self.feature_keys:
+            raw_value = row_features.get(feature_key)
+            if raw_value is None:
+                continue
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError):
+                continue
+
+            for cls, log_name in ((1, "pos"), (0, "neg")):
+                class_stats = self.stats.get(feature_key, {}).get(cls)
+                if not class_stats:
+                    continue
+                mean = class_stats["mean"]
+                variance = class_stats["var"]
+                log_likelihood = -0.5 * (math.log(2.0 * math.pi * variance) + ((value - mean) ** 2) / variance)
+                if log_name == "pos":
+                    log_pos += log_likelihood
+                else:
+                    log_neg += log_likelihood
+
+        max_log = max(log_pos, log_neg)
+        p_pos = math.exp(log_pos - max_log)
+        p_neg = math.exp(log_neg - max_log)
+        risk = p_pos / (p_pos + p_neg)
+        pred = 1 if risk >= self.threshold else 0
+        return pred, risk
+
+    def predict_class(self, row_features: dict[str, Any]) -> int:
+        return self.predict(row_features)[0]
+
+    def predict_risk(self, row_features: dict[str, Any]) -> float:
+        return self.predict(row_features)[1]
+
+    def predict_batch(self, df: pd.DataFrame) -> list[tuple[int, float]]:
+        return [self.predict(row.to_dict()) for _, row in df.iterrows()]
+
+
+GaussianNaiveBayes = GaussianNaiveBayesModel
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # DECISION TREE  (binary CART, matches sklearn DecisionTreeClassifier)
 # ═══════════════════════════════════════════════════════════════════════════════
 

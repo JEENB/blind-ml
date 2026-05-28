@@ -21,6 +21,10 @@ FRAUD_NOTEBOOK_SYMBOLS = [
     "naive_bayes_predict",
     "data_table",
     "training_summary_table",
+    "run_encrypted_gnb_fraud",
+    "train_plaintext_gnb_fraud",
+    "fraud_gnb_predict",
+    "fraud_plaintext_gnb_predict_proba",
     "run_encrypted_dt_fraud",
     "fraud_dt_predict",
     "train_plaintext_dt_fraud",
@@ -92,7 +96,7 @@ def main() -> int:
         "model exports",
         lambda: _require_symbols(
             "blind_ml",
-            ["NaiveBayesModel", "DecisionTreeModel", "LogisticRegressionModel"],
+            ["NaiveBayesModel", "DecisionTreeModel", "LogisticRegressionModel", "GaussianNaiveBayesModel"],
         ),
     )
     check("client", lambda: _require_symbols("blind_ml.client", ["BlindInsightClient"]))
@@ -132,10 +136,28 @@ def main() -> int:
     check("demo_data/upload_batches/ exists", upload_batches_dir)
 
     def model_smoke():
-        from blind_ml import NaiveBayesModel
+        import pandas as pd
+
+        from blind_ml import (
+            GaussianNaiveBayesModel,
+            NaiveBayesModel,
+
+        )
 
         m = NaiveBayesModel()
         assert m is not None
+
+        gnb = GaussianNaiveBayesModel().fit(
+            [
+                ("score", 1, 3, 10.0, 1.0),
+                ("score", 0, 3, 0.0, 1.0),
+            ],
+            n_pos=3,
+            n_neg=3,
+        )
+        pred, risk = gnb.predict({"score": 9.0})
+        assert pred == 1
+        assert risk > 0.5
 
     check("NaiveBayesModel()", model_smoke)
 
