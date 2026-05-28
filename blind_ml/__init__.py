@@ -2,14 +2,13 @@
 
 from .models import (
     DecisionTreeModel,
+    GaussianNaiveBayesModel,
     LogisticRegressionModel,
     NaiveBayesModel,
-    GaussianNaiveBayesModel,
     apply_platt,
     build_design_matrix,
     build_dummy_index,
     build_marginals_local,
-    build_gaussian_marginals_local,
     compute_pairwise_local,
     entropy,
     extract_marginals,
@@ -26,7 +25,6 @@ __all__ = [
     "gini",
     "entropy",
     "build_marginals_local",
-    "build_gaussian_marginals_local",
     "extract_marginals",
     "extract_pos_counts",
     "compute_pairwise_local",
