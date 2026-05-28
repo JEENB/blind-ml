@@ -136,12 +136,10 @@ def main() -> int:
     check("demo_data/upload_batches/ exists", upload_batches_dir)
 
     def model_smoke():
-        import pandas as pd
 
         from blind_ml import (
             GaussianNaiveBayesModel,
             NaiveBayesModel,
-
         )
 
         m = NaiveBayesModel()

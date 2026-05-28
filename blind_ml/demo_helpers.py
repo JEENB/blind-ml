@@ -20,6 +20,9 @@ from .models import (
     DecisionTreeModel as _DecisionTreeModel,
 )
 from .models import (
+    GaussianNaiveBayesModel as _GaussianNaiveBayesModel,
+)
+from .models import (
     LogisticRegressionModel as _LogisticRegressionModel,
 )
 from .models import (
@@ -31,10 +34,6 @@ from .models import (
 from .models import (
     compute_pairwise_local as _compute_pairwise_local,
 )
-from .models import (
-    GaussianNaiveBayesModel as _GaussianNaiveBayesModel,
-)
-
 
 # =============================================================================
 # HTML TABLE BUILDERS - Keep notebook cells clean
@@ -1943,9 +1942,7 @@ def _fraud_gnb_features(
         return list(_FRAUD_GNB_DEFAULT_FEATURES)
 
     available = [
-        feature
-        for feature in _FRAUD_GNB_DEFAULT_FEATURES
-        if feature_values.get(_FRAUD_GNB_FEATURE_MAP[feature][0])
+        feature for feature in _FRAUD_GNB_DEFAULT_FEATURES if feature_values.get(_FRAUD_GNB_FEATURE_MAP[feature][0])
     ]
     return available or list(_FRAUD_GNB_DEFAULT_FEATURES)
 
