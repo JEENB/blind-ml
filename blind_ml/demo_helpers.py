@@ -31,6 +31,10 @@ from .models import (
 from .models import (
     compute_pairwise_local as _compute_pairwise_local,
 )
+from .models import (
+    GaussianNaiveBayesModel as _GaussianNaiveBayesModel,
+)
+
 
 # =============================================================================
 # HTML TABLE BUILDERS - Keep notebook cells clean
@@ -1796,6 +1800,202 @@ def fraud_lr_predict(
     lr.beta = beta
     lr.dummy_index = list(dummy_index)
     return lr.predict(_fraud_row_features(row), use_sigmoid=use_sigmoid)
+
+
+# =============================================================================
+# ENCRYPTED GAUSSIAN NAIVE BAYES (fraud)
+# =============================================================================
+
+_FRAUD_GNB_FEATURE_MAP = {
+    "month": ("month_values", "month"),
+    "day": ("day_values", "day"),
+    "year": ("year_values", "year"),
+}
+
+_FRAUD_GNB_DEFAULT_FEATURES = ["month", "day", "year"]
+
+
+def _fraud_gnb_features(
+    feature_values: dict[str, list[str]] | None = None,
+    numeric_features: list[str] | None = None,
+) -> list[str]:
+    """Resolve numeric fraud features for Gaussian Naive Bayes."""
+    if numeric_features is not None:
+        unknown = [feature for feature in numeric_features if feature not in _FRAUD_GNB_FEATURE_MAP]
+        if unknown:
+            raise ValueError(f"Unsupported GaussianNB fraud features: {unknown}")
+        return list(numeric_features)
+
+    if feature_values is None:
+        return list(_FRAUD_GNB_DEFAULT_FEATURES)
+
+    available = [
+        feature
+        for feature in _FRAUD_GNB_DEFAULT_FEATURES
+        if feature_values.get(_FRAUD_GNB_FEATURE_MAP[feature][0])
+    ]
+    return available or list(_FRAUD_GNB_DEFAULT_FEATURES)
+
+
+def _fraud_gnb_row_features(row: dict, numeric_features: list[str]) -> dict[str, float]:
+    """Extract numeric fraud row features for Gaussian Naive Bayes."""
+    return {feature: float(row.get(feature, 0)) for feature in numeric_features}
+
+
+def _fraud_gnb_count_queries(
+    feature_values: dict[str, list[str]],
+    numeric_features: list[str] | None = None,
+) -> list[tuple[str, int, str, str]]:
+    """Build class-split value-count queries for GaussianNB numeric summaries."""
+    queries = []
+    for feature in _fraud_gnb_features(feature_values, numeric_features):
+        values_key, field_name = _FRAUD_GNB_FEATURE_MAP[feature]
+        for value in feature_values.get(values_key, []):
+            value_str = str(value)
+            queries.append((feature, 1, value_str, f"risk_level:count(50~100),{field_name}:{value_str}"))
+            queries.append((feature, 0, value_str, f"risk_level:count(0~49),{field_name}:{value_str}"))
+    return queries
+
+
+def _fraud_gnb_sufficient_stats(raw_results: list[tuple]) -> list[tuple[str, int, int, float, float]]:
+    """Convert class-split integer value counts into Gaussian sufficient stats."""
+    accum: dict[tuple[str, int], dict[str, float]] = {}
+    for feature, class_label, raw_value, count in raw_results:
+        value = float(raw_value)
+        n = int(count)
+        key = (str(feature), int(class_label))
+        stats = accum.setdefault(key, {"count": 0.0, "sum": 0.0, "sum_sq": 0.0})
+        stats["count"] += n
+        stats["sum"] += value * n
+        stats["sum_sq"] += value * value * n
+
+    return [
+        (feature, class_label, int(stats["count"]), stats["sum"], stats["sum_sq"])
+        for (feature, class_label), stats in sorted(accum.items())
+    ]
+
+
+def run_encrypted_gnb_fraud(
+    client,
+    org: str,
+    dataset: str,
+    schema: str,
+    feature_values: dict[str, list[str]],
+    numeric_features: list[str] | None = None,
+    n_high: int | None = None,
+    n_low: int | None = None,
+    var_smoothing: float = 1e-9,
+    threshold: float = 0.5,
+    max_workers: int = 30,
+) -> dict[str, Any]:
+    """Train GaussianNaiveBayesModel from encrypted value-count queries."""
+    start = time.time()
+    base_rate_queries = 0
+    if n_high is None or n_low is None or int(n_high) + int(n_low) == 0:
+        n_high, n_low = get_bi_base_rates(client, org, dataset, schema)
+        base_rate_queries = 2
+
+    features = _fraud_gnb_features(feature_values, numeric_features)
+    queries = _fraud_gnb_count_queries(feature_values, features)
+    raw_results: list[tuple] = []
+
+    def run_query(q):
+        feature, class_label, value, query = q
+        count = get_encrypted_count(client, org, dataset, schema, query)
+        return (feature, class_label, value, count)
+
+    n_batches = 3 if len(queries) >= 3 else 1
+    base = len(queries) // n_batches
+    remainder = len(queries) % n_batches
+    batch_plan = [base + (1 if i < remainder else 0) for i in range(n_batches)]
+
+    offset = 0
+    for planned_size in batch_plan:
+        batch = queries[offset : offset + planned_size]
+        if not batch:
+            break
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            raw_results.extend(executor.map(run_query, batch))
+        offset += planned_size
+
+    sufficient_stats = _fraud_gnb_sufficient_stats(raw_results)
+    model = _GaussianNaiveBayesModel(
+        var_smoothing=var_smoothing,
+        threshold=threshold,
+    ).fit_from_sums(
+        sufficient_stats,
+        n_pos=int(n_high),
+        n_neg=int(n_low),
+    )
+
+    return {
+        "_model": model,
+        "raw_results": raw_results,
+        "sufficient_stats": sufficient_stats,
+        "features": features,
+        "n_high": int(n_high),
+        "n_low": int(n_low),
+        "n_total": int(n_high) + int(n_low),
+        "enc_queries": len(raw_results) + base_rate_queries,
+        "stat_queries": len(raw_results),
+        "base_rate_queries": base_rate_queries,
+        "train_time": time.time() - start,
+    }
+
+
+def train_plaintext_gnb_fraud(
+    df: pd.DataFrame,
+    numeric_features: list[str] | None = None,
+    var_smoothing: float = 1e-9,
+) -> dict[str, Any]:
+    """Train sklearn GaussianNB on local plaintext fraud numeric features."""
+    from sklearn.naive_bayes import GaussianNB
+
+    start = time.time()
+    features = _fraud_gnb_features(numeric_features=numeric_features)
+    df2 = df.copy()
+    df2["is_high_risk"] = (df2["risk_level"].astype(int) >= 50).astype(int)
+
+    X = df2[features].apply(pd.to_numeric, errors="coerce")
+    if X.isnull().any().any():
+        bad_cols = X.columns[X.isnull().any()].tolist()
+        raise ValueError(f"GaussianNB fraud features must be numeric and non-null: {bad_cols}")
+    y = df2["is_high_risk"].astype(int)
+
+    model = GaussianNB(var_smoothing=var_smoothing)
+    model.fit(X, y)
+
+    n_high = int(y.sum())
+    n_low = len(df2) - n_high
+    return {
+        "model": model,
+        "features": features,
+        "n_high": n_high,
+        "n_low": n_low,
+        "n_total": n_high + n_low,
+        "train_time": time.time() - start,
+    }
+
+
+def fraud_gnb_predict(gnb_result: dict, row: dict) -> tuple[int, float]:
+    """Predict with a fraud GaussianNaiveBayesModel. Returns (pred, risk)."""
+    model = gnb_result.get("_model")
+    features = gnb_result.get("features", _FRAUD_GNB_DEFAULT_FEATURES)
+    if model:
+        return model.predict(_fraud_gnb_row_features(row, features))
+    return 0, 0.0
+
+
+def fraud_plaintext_gnb_predict_proba(
+    model,
+    feature_columns: list[str],
+    df_test: pd.DataFrame,
+) -> list[float]:
+    """Predict sklearn GaussianNB P(high_risk) on fraud data."""
+    X = df_test[feature_columns].apply(pd.to_numeric, errors="coerce")
+    proba = model.predict_proba(X)
+    pos_idx = list(model.classes_).index(1) if 1 in model.classes_ else 0
+    return [float(p[pos_idx]) for p in proba]
 
 
 # platt_scale and apply_platt are imported from blind_ml at module top
