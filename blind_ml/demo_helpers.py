@@ -10,12 +10,16 @@ import os
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
+from itertools import product
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
+from .models import (
+    BayesianNetworkClassifierModel as _BayesianNetworkClassifierModel,
+)
 from .models import (
     DecisionTreeModel as _DecisionTreeModel,
 )
@@ -24,6 +28,9 @@ from .models import (
 )
 from .models import (
     LogisticRegressionModel as _LogisticRegressionModel,
+)
+from .models import (
+    build_bayesian_cpt_counts_local as _build_bayesian_cpt_counts_local,
 )
 from .models import (
     build_design_matrix as _build_design_matrix,
@@ -1395,8 +1402,13 @@ def training_summary_table(
     enc_queries: int,
     enc_train_time: float,
     plain_train_time: float,
+    plain_queries: int = 0,
 ) -> str:
-    """Build the training comparison table (Plaintext vs Blind Insight)."""
+    """Build the training comparison table (Plaintext vs Blind Insight).
+
+    ``plain_queries`` is BI/HTTP aggregate calls for the plaintext path (usually 0
+    for local SQLite training). ``enc_queries`` is the encrypted path only.
+    """
     overhead = enc_train_time - plain_train_time
     overhead_class = "status-good" if overhead < 180 else "status-bad"
     return metrics_table(
@@ -1404,7 +1416,7 @@ def training_summary_table(
             {"label": "High Risk", "values": [f"{n_high_plain:,}", f"{n_high_enc:,}", "-"]},
             {"label": "Low Risk", "values": [f"{n_low_plain:,}", f"{n_low_enc:,}", "-"]},
             {"label": "Total", "values": [f"{n_high_plain + n_low_plain:,}", f"{n_high_enc + n_low_enc:,}", "-"]},
-            {"label": "Queries", "values": [str(enc_queries), str(enc_queries), "-"]},
+            {"label": "Queries", "values": [str(plain_queries), str(enc_queries), "-"]},
             {
                 "label": "Train Time",
                 "values": [f"{plain_train_time:.6f}s", f"{enc_train_time:.1f}s", f"+{overhead:.1f}s"],
@@ -2106,6 +2118,204 @@ def fraud_plaintext_gnb_predict_proba(
     proba = model.predict_proba(X)
     pos_idx = list(model.classes_).index(1) if 1 in model.classes_ else 0
     return [float(p[pos_idx]) for p in proba]
+
+
+# =============================================================================
+# ENCRYPTED BAYESIAN NETWORK (fraud)
+# =============================================================================
+
+_FRAUD_BN_PARENT_MAP = {
+    "fraud_type": [],
+    "account_jurisdiction": ["fraud_type"],
+    "is_active": ["fraud_type"],
+    "month": ["year"],
+    "reporting_bank_id": ["account_jurisdiction"],
+    "year": [],
+}
+
+
+def _fraud_bn_feature_values(feature_values: dict[str, list[str]]) -> dict[str, list[str]]:
+    """Map notebook feature-value config to BayesianNetwork feature keys."""
+    return {
+        feature: [str(value).lower() for value in feature_values.get(values_key, [])]
+        for feature, (values_key, _field_name) in _FRAUD_FEATURE_MAP.items()
+    }
+
+
+def _fraud_bn_query_values(feature_values: dict[str, list[str]]) -> dict[str, list[str]]:
+    """Feature values in the original BI query casing."""
+    return {
+        feature: [str(value) for value in feature_values.get(values_key, [])]
+        for feature, (values_key, _field_name) in _FRAUD_FEATURE_MAP.items()
+    }
+
+
+def _fraud_query_filter(feature: str, value: str) -> str:
+    """Build a Blind Insight equality filter for one fraud feature value."""
+    field_name = _FRAUD_FEATURE_MAP[feature][1]
+    if feature == "account_jurisdiction":
+        value = str(value).upper()
+    elif feature == "is_active":
+        value = str(value).lower()
+    return f"{field_name}:{value}"
+
+
+def _fraud_bn_cpt_count_queries(
+    feature_values: dict[str, list[str]],
+    parent_map: dict[str, list[str]] | None = None,
+) -> list[tuple[str, int, tuple[tuple[str, str], ...], str, str]]:
+    """Build encrypted count queries for fraud Bayesian-network CPT cells."""
+    resolved_parent_map = parent_map or _FRAUD_BN_PARENT_MAP
+    values_by_feature = _fraud_bn_query_values(feature_values)
+    queries: list[tuple[str, int, tuple[tuple[str, str], ...], str, str]] = []
+
+    for feature in _FRAUD_FEATURES_ORDERED:
+        parents = resolved_parent_map.get(feature, [])
+        parent_value_lists = [values_by_feature.get(parent, []) for parent in parents]
+        parent_combos = list(product(*parent_value_lists)) if parent_value_lists else [tuple()]
+
+        for class_label, risk_filter in ((1, "risk_level:count(50~100)"), (0, "risk_level:count(0~49)")):
+            for parent_combo in parent_combos:
+                parent_state = tuple((parent, str(value).lower()) for parent, value in zip(parents, parent_combo))
+                parent_filters = [
+                    _fraud_query_filter(parent, str(value)) for parent, value in zip(parents, parent_combo)
+                ]
+                for value in values_by_feature.get(feature, []):
+                    filters = [risk_filter, *parent_filters, _fraud_query_filter(feature, value)]
+                    queries.append((feature, class_label, parent_state, str(value).lower(), ",".join(filters)))
+    return queries
+
+
+def run_encrypted_bn_fraud(
+    client,
+    org: str,
+    dataset: str,
+    schema: str,
+    feature_values: dict[str, list[str]],
+    parent_map: dict[str, list[str]] | None = None,
+    n_high: int | None = None,
+    n_low: int | None = None,
+    alpha: float = 1.0,
+    threshold: float = 0.5,
+    max_workers: int = 30,
+) -> dict[str, Any]:
+    """Train BayesianNetworkClassifierModel from encrypted CPT count queries."""
+    start = time.time()
+    base_rate_queries = 0
+    if n_high is None or n_low is None or int(n_high) + int(n_low) == 0:
+        n_high, n_low = get_bi_base_rates(client, org, dataset, schema)
+        base_rate_queries = 2
+
+    resolved_parent_map = parent_map or _FRAUD_BN_PARENT_MAP
+    queries = _fraud_bn_cpt_count_queries(feature_values, resolved_parent_map)
+    raw_results: list[tuple[str, int, tuple[tuple[str, str], ...], str, int]] = []
+
+    def run_query(query_tuple):
+        feature, class_label, parent_state, value, query = query_tuple
+        count = get_encrypted_count(client, org, dataset, schema, query)
+        return (feature, class_label, parent_state, value, count)
+
+    n_batches = 3 if len(queries) >= 3 else 1
+    base = len(queries) // n_batches
+    remainder = len(queries) % n_batches
+    batch_plan = [base + (1 if i < remainder else 0) for i in range(n_batches)]
+
+    offset = 0
+    for planned_size in batch_plan:
+        batch = queries[offset : offset + planned_size]
+        if not batch:
+            break
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            raw_results.extend(executor.map(run_query, batch))
+        offset += planned_size
+
+    model = _BayesianNetworkClassifierModel(
+        parent_map=resolved_parent_map,
+        alpha=alpha,
+        threshold=threshold,
+    ).fit(
+        raw_results,
+        n_pos=int(n_high),
+        n_neg=int(n_low),
+        feature_values=_fraud_bn_feature_values(feature_values),
+    )
+
+    return {
+        "_model": model,
+        "raw_results": raw_results,
+        "parent_map": resolved_parent_map,
+        "feature_values": feature_values,
+        "n_high": int(n_high),
+        "n_low": int(n_low),
+        "n_total": int(n_high) + int(n_low),
+        "enc_queries": len(raw_results) + base_rate_queries,
+        "cpt_queries": len(raw_results),
+        "base_rate_queries": base_rate_queries,
+        "train_time": time.time() - start,
+    }
+
+
+def train_plaintext_bn_fraud(
+    df: pd.DataFrame,
+    feature_values: dict[str, list[str]],
+    parent_map: dict[str, list[str]] | None = None,
+    alpha: float = 1.0,
+    threshold: float = 0.5,
+) -> dict[str, Any]:
+    """Train BayesianNetworkClassifierModel from local plaintext CPT counts."""
+    start = time.time()
+    resolved_parent_map = parent_map or _FRAUD_BN_PARENT_MAP
+    df2 = df.copy()
+    df2["is_high_risk"] = (df2["risk_level"].astype(int) >= 50).astype(int)
+
+    model_feature_values = _fraud_bn_feature_values(feature_values)
+    cpt_counts = _build_bayesian_cpt_counts_local(
+        df2,
+        target_col="is_high_risk",
+        feature_values=model_feature_values,
+        parent_map=resolved_parent_map,
+    )
+    n_high = int(df2["is_high_risk"].sum())
+    n_low = len(df2) - n_high
+    model = _BayesianNetworkClassifierModel(
+        parent_map=resolved_parent_map,
+        alpha=alpha,
+        threshold=threshold,
+    ).fit(
+        cpt_counts,
+        n_pos=n_high,
+        n_neg=n_low,
+        feature_values=model_feature_values,
+    )
+
+    return {
+        "_model": model,
+        "raw_results": cpt_counts,
+        "parent_map": resolved_parent_map,
+        "n_high": n_high,
+        "n_low": n_low,
+        "n_total": n_high + n_low,
+        "train_time": time.time() - start,
+    }
+
+
+def fraud_bn_predict(bn_result: dict, row: dict) -> tuple[int, float]:
+    """Predict with a fraud BayesianNetworkClassifierModel. Returns (pred, risk)."""
+    model = bn_result.get("_model")
+    if model:
+        return model.predict(_fraud_row_features(row))
+    return 0, 0.0
+
+
+def fraud_plaintext_bn_predict_proba(
+    bn_result: dict,
+    df_test: pd.DataFrame,
+) -> list[float]:
+    """Predict plaintext Bayesian Network P(high_risk) on fraud data."""
+    model = bn_result.get("_model")
+    if not model:
+        return []
+    return [model.predict(_fraud_row_features(row.to_dict()))[1] for _, row in df_test.iterrows()]
 
 
 # platt_scale and apply_platt are imported from blind_ml at module top

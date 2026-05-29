@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import math
 import time
+from itertools import product
 from typing import Any
 
 import numpy as np
@@ -352,6 +353,266 @@ class GaussianNaiveBayesModel:
 
 
 GaussianNaiveBayes = GaussianNaiveBayesModel
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# BAYESIAN NETWORK CLASSIFIER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class BayesianNetworkClassifierModel:
+    """Discrete Bayesian-network classifier trained from conditional counts.
+
+    The target class is implicit and acts as a parent of every feature.  The
+    optional ``parent_map`` adds directed feature-to-feature dependencies, so
+    prediction uses:
+
+    ``P(class | x) ∝ P(class) × Π P(feature | class, feature_parents)``.
+
+    The conditional-probability tables can be built from encrypted aggregate
+    counts because every CPT cell is just a filtered count.
+    """
+
+    def __init__(
+        self,
+        parent_map: dict[str, list[str]] | None = None,
+        alpha: float = 1.0,
+        threshold: float = 0.5,
+        backoff_to_marginal: bool = True,
+    ) -> None:
+        self.parent_map = {feature: list(parents) for feature, parents in (parent_map or {}).items()}
+        self.alpha = alpha
+        self.threshold = threshold
+        self.backoff_to_marginal = backoff_to_marginal
+        self.P_pos: float = 0.5
+        self.P_neg: float = 0.5
+        self.feature_keys: list[str] = []
+        self.feature_values: dict[str, list[str]] = {}
+        self.cpts: dict[str, dict[int, dict[tuple[tuple[str, str], ...], dict[str, float]]]] = {}
+        self.marginals: dict[str, dict[int, dict[str, float]]] = {}
+        self.default_probs: dict[str, dict[int, float]] = {}
+        self.train_time: float = 0.0
+
+    @staticmethod
+    def _norm_value(value: Any) -> str:
+        return str(value).lower()
+
+    def _normalize_parent_state(
+        self,
+        feature_key: str,
+        parent_values: dict[str, Any] | list[tuple[str, Any]] | tuple[tuple[str, Any], ...] | None,
+    ) -> tuple[tuple[str, str], ...]:
+        parent_order = self.parent_map.get(feature_key, [])
+        if not parent_order:
+            return tuple()
+
+        if parent_values is None:
+            provided: dict[str, Any] = {}
+        elif isinstance(parent_values, dict):
+            provided = parent_values
+        else:
+            provided = dict(parent_values)
+
+        return tuple((parent, self._norm_value(provided.get(parent, ""))) for parent in parent_order)
+
+    def _validate_graph(self, feature_keys: list[str]) -> None:
+        feature_set = set(feature_keys)
+        for feature, parents in self.parent_map.items():
+            if feature not in feature_set:
+                raise ValueError(f"parent_map contains unknown feature {feature!r}")
+            unknown = [parent for parent in parents if parent not in feature_set]
+            if unknown:
+                raise ValueError(f"parent_map[{feature!r}] contains unknown parents: {unknown}")
+            if feature in parents:
+                raise ValueError(f"parent_map[{feature!r}] cannot include itself as a parent")
+
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def visit(feature: str) -> None:
+            if feature in visited:
+                return
+            if feature in visiting:
+                raise ValueError("parent_map must be acyclic")
+            visiting.add(feature)
+            for parent in self.parent_map.get(feature, []):
+                visit(parent)
+            visiting.remove(feature)
+            visited.add(feature)
+
+        for feature in feature_keys:
+            visit(feature)
+
+    def fit(
+        self,
+        cpt_counts: list[tuple[str, int, Any, str, int]],
+        n_pos: int,
+        n_neg: int,
+        feature_values: dict[str, list[str]],
+    ) -> BayesianNetworkClassifierModel:
+        """Fit CPTs from conditional count tuples.
+
+        Parameters
+        ----------
+        cpt_counts : list of ``(feature_key, class_label, parent_values, value, count)``
+            ``parent_values`` may be a dict or tuple/list of ``(parent, value)``
+            pairs matching ``parent_map[feature_key]``.
+        n_pos, n_neg : class totals
+        feature_values : ``{feature_key: [possible_values]}``
+        """
+        start = time.time()
+        if not feature_values:
+            raise ValueError("feature_values must contain at least one feature")
+        if self.alpha < 0:
+            raise ValueError("alpha must be >= 0")
+
+        self.feature_keys = list(feature_values.keys())
+        self.feature_values = {
+            feature_key: [self._norm_value(value) for value in values] for feature_key, values in feature_values.items()
+        }
+        for feature_key in self.feature_keys:
+            self.parent_map.setdefault(feature_key, [])
+        self._validate_graph(self.feature_keys)
+
+        n_total = int(n_pos) + int(n_neg)
+        self.P_pos = int(n_pos) / n_total if n_total > 0 else 0.5
+        self.P_neg = int(n_neg) / n_total if n_total > 0 else 0.5
+
+        counts: dict[str, dict[int, dict[tuple[tuple[str, str], ...], dict[str, int]]]] = {}
+        marginal_counts: dict[str, dict[int, dict[str, int]]] = {}
+        for feature_key, class_label, parent_values, raw_value, raw_count in cpt_counts:
+            feature = str(feature_key)
+            if feature not in self.feature_values:
+                continue
+            cls = int(class_label)
+            if cls not in (0, 1):
+                raise ValueError("BayesianNetworkClassifierModel supports binary class labels 0 and 1")
+            value = self._norm_value(raw_value)
+            count = int(raw_count)
+            parent_state = self._normalize_parent_state(feature, parent_values)
+            counts.setdefault(feature, {}).setdefault(cls, {}).setdefault(parent_state, {})[value] = (
+                counts.setdefault(feature, {}).setdefault(cls, {}).setdefault(parent_state, {}).get(value, 0) + count
+            )
+            marginal_counts.setdefault(feature, {}).setdefault(cls, {})[value] = (
+                marginal_counts.setdefault(feature, {}).setdefault(cls, {}).get(value, 0) + count
+            )
+
+        self.cpts = {feature: {1: {}, 0: {}} for feature in self.feature_keys}
+        self.marginals = {feature: {1: {}, 0: {}} for feature in self.feature_keys}
+        self.default_probs = {feature: {1: 0.0, 0: 0.0} for feature in self.feature_keys}
+
+        for feature in self.feature_keys:
+            values = self.feature_values[feature]
+            n_values = max(1, len(values))
+            for cls in (1, 0):
+                class_counts = marginal_counts.get(feature, {}).get(cls, {})
+                class_total = sum(class_counts.values())
+                marginal_denom = class_total + self.alpha * n_values
+                self.default_probs[feature][cls] = (
+                    (self.alpha / marginal_denom) if marginal_denom > 0 else 1.0 / n_values
+                )
+                for value in values:
+                    self.marginals[feature][cls][value] = (
+                        (class_counts.get(value, 0) + self.alpha) / marginal_denom
+                        if marginal_denom > 0
+                        else 1.0 / n_values
+                    )
+
+                for parent_state, state_counts in counts.get(feature, {}).get(cls, {}).items():
+                    parent_total = sum(state_counts.values())
+                    denom = parent_total + self.alpha * n_values
+                    self.cpts[feature][cls][parent_state] = {}
+                    for value in values:
+                        self.cpts[feature][cls][parent_state][value] = (
+                            (state_counts.get(value, 0) + self.alpha) / denom if denom > 0 else 1.0 / n_values
+                        )
+
+        self.train_time = time.time() - start
+        return self
+
+    def fit_dataframe(
+        self,
+        df: pd.DataFrame,
+        feature_columns: list[str],
+        target_col: str,
+        feature_values: dict[str, list[str]] | None = None,
+    ) -> BayesianNetworkClassifierModel:
+        """Fit CPTs from a plaintext categorical DataFrame."""
+        if not feature_columns:
+            raise ValueError("feature_columns must contain at least one feature")
+
+        working = df.copy()
+        for feature in feature_columns:
+            working[feature] = working[feature].astype(str).str.lower()
+        y = working[target_col].astype(int)
+        if not set(y.unique()).issubset({0, 1}):
+            raise ValueError("BayesianNetworkClassifierModel requires binary target labels 0 and 1")
+
+        if feature_values is None:
+            feature_values = {
+                feature: sorted(working[feature].astype(str).str.lower().unique().tolist())
+                for feature in feature_columns
+            }
+        else:
+            feature_values = {
+                feature: [self._norm_value(value) for value in feature_values.get(feature, [])]
+                for feature in feature_columns
+            }
+
+        for feature in feature_columns:
+            self.parent_map.setdefault(feature, [])
+        self._validate_graph(feature_columns)
+
+        cpt_counts = build_bayesian_cpt_counts_local(
+            working,
+            target_col=target_col,
+            feature_values=feature_values,
+            parent_map=self.parent_map,
+        )
+
+        return self.fit(
+            cpt_counts,
+            n_pos=int((y == 1).sum()),
+            n_neg=int((y == 0).sum()),
+            feature_values=feature_values,
+        )
+
+    def predict(self, row_features: dict[str, Any]) -> tuple[int, float]:
+        """Return ``(predicted_class, posterior_risk)`` for one row."""
+        eps = 1e-12
+        log_scores = {
+            1: math.log(self.P_pos + eps),
+            0: math.log(self.P_neg + eps),
+        }
+
+        for feature in self.feature_keys:
+            value = self._norm_value(row_features.get(feature, ""))
+            parent_values = {parent: row_features.get(parent, "") for parent in self.parent_map.get(feature, [])}
+            parent_state = self._normalize_parent_state(feature, parent_values)
+            for cls in (1, 0):
+                probs = self.cpts.get(feature, {}).get(cls, {}).get(parent_state)
+                if probs is None and self.backoff_to_marginal:
+                    probs = self.marginals.get(feature, {}).get(cls, {})
+                prob = (probs or {}).get(value, self.default_probs.get(feature, {}).get(cls, eps))
+                log_scores[cls] += math.log(max(prob, eps))
+
+        max_log = max(log_scores.values())
+        p_pos = math.exp(log_scores[1] - max_log)
+        p_neg = math.exp(log_scores[0] - max_log)
+        risk = p_pos / (p_pos + p_neg)
+        return (1 if risk >= self.threshold else 0), risk
+
+    def predict_class(self, row_features: dict[str, Any]) -> int:
+        return self.predict(row_features)[0]
+
+    def predict_risk(self, row_features: dict[str, Any]) -> float:
+        return self.predict(row_features)[1]
+
+    def predict_batch(self, df: pd.DataFrame) -> list[tuple[int, float]]:
+        return [self.predict(row.to_dict()) for _, row in df.iterrows()]
+
+
+BayesianNetwork = BayesianNetworkClassifierModel
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -989,3 +1250,49 @@ def apply_platt(risk: float, a: float, b: float) -> float:
     """Apply Platt scaling to a single risk score."""
     z = max(-500, min(500, a * risk + b))
     return 1.0 / (1.0 + math.exp(-z))
+
+
+def build_bayesian_cpt_counts_local(
+    df: pd.DataFrame,
+    target_col: str,
+    feature_values: dict[str, list[str]],
+    parent_map: dict[str, list[str]] | None = None,
+    col_map: dict[str, str] | None = None,
+) -> list[tuple[str, int, tuple[tuple[str, str], ...], str, int]]:
+    """Build Bayesian-network CPT counts from a local categorical DataFrame.
+
+    Returns ``(feature_key, class_label, parent_state, value, count)`` tuples
+    compatible with ``BayesianNetworkClassifierModel.fit``.  The output includes
+    explicit zero-count CPT cells so plaintext and encrypted aggregate workflows
+    have the same table shape.
+    """
+    parent_map = {feature: list(parents) for feature, parents in (parent_map or {}).items()}
+    col_map = col_map or {}
+    values = {
+        feature: [str(value).lower() for value in feature_possible_values]
+        for feature, feature_possible_values in feature_values.items()
+    }
+
+    working = df.copy()
+    for feature in values:
+        column = col_map.get(feature, feature)
+        working[column] = working[column].astype(str).str.lower()
+    working[target_col] = working[target_col].astype(int)
+
+    results: list[tuple[str, int, tuple[tuple[str, str], ...], str, int]] = []
+    for feature, feature_possible_values in values.items():
+        parents = parent_map.get(feature, [])
+        feature_column = col_map.get(feature, feature)
+        group_columns = [target_col, *(col_map.get(parent, parent) for parent in parents), feature_column]
+        grouped = working.groupby(group_columns, dropna=False).size().to_dict()
+        parent_value_lists = [values[parent] for parent in parents]
+        parent_combos = list(product(*parent_value_lists)) if parent_value_lists else [tuple()]
+
+        for class_label in (1, 0):
+            for parent_combo in parent_combos:
+                parent_state = tuple((parent, parent_value) for parent, parent_value in zip(parents, parent_combo))
+                for value in feature_possible_values:
+                    group_key = (class_label, *parent_combo, value)
+                    count = int(grouped.get(group_key, 0))
+                    results.append((feature, class_label, parent_state, value, count))
+    return results

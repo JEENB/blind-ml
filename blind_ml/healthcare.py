@@ -1093,6 +1093,7 @@ def bc_training_summary_table(
     enc_queries: int,
     enc_train_time: float,
     plain_train_time: float,
+    plain_queries: int = 0,
 ) -> str:
     overhead = enc_train_time - plain_train_time
     overhead_class = "status-good" if overhead < 180 else "status-bad"
@@ -1104,7 +1105,7 @@ def bc_training_summary_table(
                 "label": "Total",
                 "values": [f"{n_cancer_plain + n_no_cancer_plain:,}", f"{n_cancer_enc + n_no_cancer_enc:,}", "-"],
             },
-            {"label": "Queries", "values": [str(enc_queries), str(enc_queries), "-"]},
+            {"label": "Queries", "values": [str(plain_queries), str(enc_queries), "-"]},
             {
                 "label": "Train Time",
                 "values": [f"{plain_train_time:.6f}s", f"{enc_train_time:.1f}s", f"+{overhead:.1f}s"],

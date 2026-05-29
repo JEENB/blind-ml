@@ -1,6 +1,7 @@
 """blind_ml — train sklearn-style models on encrypted data via Blind Insight."""
 
 from .models import (
+    BayesianNetworkClassifierModel,
     DecisionTreeModel,
     GaussianNaiveBayesModel,
     LogisticRegressionModel,
@@ -22,6 +23,7 @@ __all__ = [
     "DecisionTreeModel",
     "LogisticRegressionModel",
     "GaussianNaiveBayesModel",
+    "BayesianNetworkClassifierModel",
     "gini",
     "entropy",
     "build_marginals_local",

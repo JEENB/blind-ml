@@ -25,6 +25,10 @@ FRAUD_NOTEBOOK_SYMBOLS = [
     "train_plaintext_gnb_fraud",
     "fraud_gnb_predict",
     "fraud_plaintext_gnb_predict_proba",
+    "run_encrypted_bn_fraud",
+    "train_plaintext_bn_fraud",
+    "fraud_bn_predict",
+    "fraud_plaintext_bn_predict_proba",
     "run_encrypted_dt_fraud",
     "fraud_dt_predict",
     "train_plaintext_dt_fraud",
@@ -96,7 +100,13 @@ def main() -> int:
         "model exports",
         lambda: _require_symbols(
             "blind_ml",
-            ["NaiveBayesModel", "DecisionTreeModel", "LogisticRegressionModel", "GaussianNaiveBayesModel"],
+            [
+                "NaiveBayesModel",
+                "DecisionTreeModel",
+                "LogisticRegressionModel",
+                "GaussianNaiveBayesModel",
+                "BayesianNetworkClassifierModel",
+            ],
         ),
     )
     check("client", lambda: _require_symbols("blind_ml.client", ["BlindInsightClient"]))
@@ -138,6 +148,7 @@ def main() -> int:
     def model_smoke():
 
         from blind_ml import (
+            BayesianNetworkClassifierModel,
             GaussianNaiveBayesModel,
             NaiveBayesModel,
         )
@@ -156,8 +167,26 @@ def main() -> int:
         pred, risk = gnb.predict({"score": 9.0})
         assert pred == 1
         assert risk > 0.5
+        bn = BayesianNetworkClassifierModel(parent_map={"shape": ["color"]}).fit(
+            [
+                ("color", 1, tuple(), "red", 8),
+                ("color", 0, tuple(), "red", 2),
+                ("color", 1, tuple(), "blue", 1),
+                ("color", 0, tuple(), "blue", 9),
+                ("shape", 1, (("color", "red"),), "round", 7),
+                ("shape", 0, (("color", "red"),), "round", 1),
+                ("shape", 1, (("color", "blue"),), "round", 1),
+                ("shape", 0, (("color", "blue"),), "round", 8),
+            ],
+            n_pos=9,
+            n_neg=11,
+            feature_values={"color": ["red", "blue"], "shape": ["round", "square"]},
+        )
+        pred, risk = bn.predict({"color": "red", "shape": "round"})
+        assert pred == 1
+        assert risk > 0.5
 
-    check("NaiveBayesModel()", model_smoke)
+    check("NaiveBayesModel(), GaussianNaiveBayesModel(), BayesianNetworkClassifierModel()", model_smoke)
 
     print("\nAll checks passed.")
     return 0
