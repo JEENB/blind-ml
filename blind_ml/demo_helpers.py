@@ -41,6 +41,9 @@ from .models import (
 from .models import (
     compute_pairwise_local as _compute_pairwise_local,
 )
+from .models import (
+    HistogramClassifierModel as _HistogramClassifierModel,
+)
 
 # =============================================================================
 # HTML TABLE BUILDERS - Keep notebook cells clean
@@ -761,6 +764,29 @@ def discover_feature_values(df: pd.DataFrame) -> dict[str, list[str]]:
         "bank_ids": sorted(df["reporting_bank_id"].astype(str).unique().tolist()),
         "year_values": sorted(df["year"].astype(str).unique().tolist(), key=lambda x: int(x)),
     }
+
+def _fraud_marginal_count_queries(values: dict[str, list[str]]) -> list[tuple[str, int, str, str]]:
+    """Build class-split marginal count queries shared by count-only models."""
+    queries = []
+    for ft in values["fraud_types"]:
+        queries.append(("fraud", 1, ft, f"risk_level:count(50~100),fraud_type:{ft}"))
+        queries.append(("fraud", 0, ft, f"risk_level:count(0~49),fraud_type:{ft}"))
+    for jur in values["jurisdictions"]:
+        queries.append(("jur", 1, jur, f"risk_level:count(50~100),account_jurisdiction:{jur.upper()}"))
+        queries.append(("jur", 0, jur, f"risk_level:count(0~49),account_jurisdiction:{jur.upper()}"))
+    for act in values["active_values"]:
+        queries.append(("active", 1, act, f"risk_level:count(50~100),is_active:{act.lower()}"))
+        queries.append(("active", 0, act, f"risk_level:count(0~49),is_active:{act.lower()}"))
+    for mon in values["month_values"]:
+        queries.append(("month", 1, mon, f"risk_level:count(50~100),month:{mon}"))
+        queries.append(("month", 0, mon, f"risk_level:count(0~49),month:{mon}"))
+    for bank in values["bank_ids"]:
+        queries.append(("bank", 1, bank, f"risk_level:count(50~100),reporting_bank_id:{bank}"))
+        queries.append(("bank", 0, bank, f"risk_level:count(0~49),reporting_bank_id:{bank}"))
+    for year in values["year_values"]:
+        queries.append(("year", 1, year, f"risk_level:count(50~100),year:{year}"))
+        queries.append(("year", 0, year, f"risk_level:count(0~49),year:{year}"))
+    return queries
 
 
 def _bi_queries(values: dict[str, list[str]]) -> list[tuple[str, int, str, str]]:
@@ -2316,6 +2342,145 @@ def fraud_plaintext_bn_predict_proba(
     if not model:
         return []
     return [model.predict(_fraud_row_features(row.to_dict()))[1] for _, row in df_test.iterrows()]
+
+
+# =============================================================================
+# ENCRYPTED HISTOGRAM CLASSIFIER (fraud)
+# =============================================================================
+
+
+def _fraud_histogram_feature_values(feature_values: dict[str, list[str]]) -> dict[str, list[str]]:
+    """Map fraud notebook feature-value config to HistogramClassifierModel keys."""
+    return {
+        "fraud": feature_values.get("fraud_types", []),
+        "jur": feature_values.get("jurisdictions", []),
+        "active": feature_values.get("active_values", []),
+        "month": feature_values.get("month_values", []),
+        "bank": feature_values.get("bank_ids", []),
+        "year": feature_values.get("year_values", []),
+    }
+
+
+def _fraud_histogram_row_features(row: dict) -> dict[str, str]:
+    """Extract fraud row features using the aggregate-count keys."""
+    return {
+        "fraud": str(row.get("fraud_type", "")).lower(),
+        "jur": str(row.get("account_jurisdiction", "")).lower(),
+        "active": str(row.get("is_active", "")).lower(),
+        "month": str(row.get("month", "")),
+        "bank": str(row.get("reporting_bank_id", "")),
+        "year": str(row.get("year", "")),
+    }
+
+
+def run_encrypted_histogram_fraud(
+    client,
+    org: str,
+    dataset: str,
+    schema: str,
+    feature_values: dict[str, list[str]],
+    n_high: int | None = None,
+    n_low: int | None = None,
+    alpha: float = 1.0,
+    threshold: float = 0.5,
+    use_feature_weights: bool = True,
+    max_workers: int = 30,
+) -> dict[str, Any]:
+    """Train HistogramClassifierModel from encrypted aggregate queries.
+
+    Fetches class base rates when not provided, runs the fraud marginal count
+    queries, then fits the histogram model directly from those counts.
+    """
+    start = time.time()
+    base_rate_queries = 0
+    if n_high is None or n_low is None or int(n_high) + int(n_low) == 0:
+        n_high, n_low = get_bi_base_rates(client, org, dataset, schema)
+        base_rate_queries = 2
+
+    queries = _fraud_marginal_count_queries(feature_values)
+    raw_results: list[tuple] = []
+
+    def run_query(q):
+        f_type, r_class, val, q_str = q
+        count = get_encrypted_count(client, org, dataset, schema, q_str)
+        return (f_type, r_class, val, count)
+
+    n_batches = 3 if len(queries) >= 3 else 1
+    base = len(queries) // n_batches
+    remainder = len(queries) % n_batches
+    batch_plan = [base + (1 if i < remainder else 0) for i in range(n_batches)]
+
+    offset = 0
+    for planned_size in batch_plan:
+        batch = queries[offset : offset + planned_size]
+        if not batch:
+            break
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            raw_results.extend(executor.map(run_query, batch))
+        offset += planned_size
+
+    model = _HistogramClassifierModel(
+        alpha=alpha,
+        threshold=threshold,
+        use_feature_weights=use_feature_weights,
+    ).fit(
+        raw_results,
+        n_pos=int(n_high),
+        n_neg=int(n_low),
+        feature_values=_fraud_histogram_feature_values(feature_values),
+    )
+
+    return {
+        "_model": model,
+        "raw_results": raw_results,
+        "n_high": int(n_high),
+        "n_low": int(n_low),
+        "n_total": int(n_high) + int(n_low),
+        "enc_queries": len(raw_results) + base_rate_queries,
+        "marginal_queries": len(raw_results),
+        "base_rate_queries": base_rate_queries,
+        "train_time": time.time() - start,
+    }
+
+
+def train_plaintext_histogram_fraud(
+    df: pd.DataFrame,
+    feature_values: dict[str, list[str]],
+    alpha: float = 1.0,
+    threshold: float = 0.5,
+    use_feature_weights: bool = True,
+) -> dict[str, Any]:
+    """Train HistogramClassifierModel from local plaintext marginal counts."""
+    start = time.time()
+    raw_results = build_raw_results_local(df, feature_values)
+    n_high = int((df["risk_level"].astype(int) >= 50).sum())
+    n_low = len(df) - n_high
+    model = _HistogramClassifierModel(
+        alpha=alpha,
+        threshold=threshold,
+        use_feature_weights=use_feature_weights,
+    ).fit(
+        raw_results,
+        n_pos=n_high,
+        n_neg=n_low,
+        feature_values=_fraud_histogram_feature_values(feature_values),
+    )
+    return {
+        "_model": model,
+        "raw_results": raw_results,
+        "n_high": n_high,
+        "n_low": n_low,
+        "n_total": n_high + n_low,
+        "train_time": time.time() - start,
+    }
+
+
+def fraud_histogram_predict(hist_result: dict, row: dict) -> tuple[int, float]:
+    """Predict with a fraud HistogramClassifierModel. Returns (pred, risk)."""
+    model = hist_result.get("_model")
+    if model:
+        return model.predict(_fraud_histogram_row_features(row))
+    return 0, 0.0
 
 
 # platt_scale and apply_platt are imported from blind_ml at module top

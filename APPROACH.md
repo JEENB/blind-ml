@@ -172,6 +172,34 @@ Logistic regression requires the feature covariance matrix (X'X) and the feature
 
 **Result:** The encrypted logistic regression model converges to the **same maximum likelihood estimate** as sklearn's `LogisticRegression`, achieving identical F1 scores.
 
+### Algorithm 4: Gaussian Naive Bayes
+
+The core `blind_ml` package implements Gaussian Naive Bayes for numeric features. Instead of categorical probability tables, each feature stores a class-conditional mean and variance.
+
+**Training:**
+1. For each numeric feature and class, compute count, mean, and variance.
+2. Store class priors from high-risk vs low-risk counts.
+3. Add variance smoothing for stable Gaussian densities.
+
+**Prediction:**
+1. Evaluate each feature under the positive and negative class Gaussian densities.
+2. Sum likelihoods in log space.
+3. Convert the two class scores into a posterior high-risk probability.
+
+### Algorithm 5: Bayesian Network
+
+A Bayesian Network generalizes Naive Bayes by allowing selected features to depend on other features. The class label is still a parent of every feature, but feature-level edges can capture relationships such as jurisdiction → bank or year → month.
+
+**Training:**
+1. Choose a directed acyclic parent map between categorical features.
+2. For each feature, class, parent-value combination, and feature value, run a filtered count query.
+3. Convert those counts into smoothed conditional probability tables (CPTs).
+
+**Prediction:**
+1. Read each row's feature values and parent feature values.
+2. Look up `P(feature | class, parents)` in each CPT.
+3. Multiply CPT probabilities in log space and normalize into `P(high_risk | row)`.
+
 ---
 
 ## Example: Training on Encrypted Data

@@ -918,6 +918,130 @@ class DecisionTreeModel:
     def predict_batch(self, df: pd.DataFrame) -> list[tuple[int, float]]:
         return [self.predict(row.to_dict()) for _, row in df.iterrows()]
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# HISTOGRAM CLASSIFIER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class HistogramClassifierModel:
+    """Categorical histogram classifier trained from aggregate marginal counts.
+
+    The model stores one posterior risk bucket per ``feature=value``:
+    ``P(positive | feature=value)``.  Prediction averages the bucket risks for
+    the row's observed feature values.  Unlike Naive Bayes, this does not
+    multiply conditionals or assume feature independence; each feature casts a
+    direct risk vote from its encrypted count histogram.
+    """
+
+    def __init__(
+        self,
+        alpha: float = 1.0,
+        threshold: float = 0.5,
+        use_feature_weights: bool = True,
+    ) -> None:
+        self.alpha = alpha
+        self.threshold = threshold
+        self.use_feature_weights = use_feature_weights
+        self.P_pos: float = 0.5
+        self.P_neg: float = 0.5
+        self.histograms: dict[str, dict[str, dict[str, float]]] = {}
+        self.feature_keys: list[str] = []
+        self.feature_weights: dict[str, float] = {}
+        self.train_time: float = 0.0
+
+    def fit(
+        self,
+        marginal_counts: list[tuple[str, int, str, int]],
+        n_pos: int,
+        n_neg: int,
+        feature_values: dict[str, list[str]] | None = None,
+    ) -> HistogramClassifierModel:
+        """Fit lookup histograms from class-split aggregate counts.
+
+        Parameters
+        ----------
+        marginal_counts : list of (feature_key, class_label, value, count)
+        n_pos, n_neg : class totals
+        feature_values : optional {feature_key: [values]} so zero-count buckets
+                         can still receive smoothed probabilities.
+        """
+        start = time.time()
+        n_total = n_pos + n_neg
+        self.P_pos = n_pos / n_total if n_total > 0 else 0.5
+        self.P_neg = n_neg / n_total if n_total > 0 else 0.5
+
+        counts: dict[str, dict[str, dict[int, int]]] = {}
+        for feature_key, class_label, raw_value, count in marginal_counts:
+            value = str(raw_value).lower()
+            class_counts = counts.setdefault(feature_key, {}).setdefault(value, {1: 0, 0: 0})
+            class_counts[int(class_label)] = class_counts.get(int(class_label), 0) + int(count)
+
+        if feature_values:
+            for feature_key in counts:
+                for raw_value in feature_values.get(feature_key, []):
+                    value = str(raw_value).lower()
+                    counts[feature_key].setdefault(value, {1: 0, 0: 0})
+
+        self.feature_keys = sorted(counts.keys())
+        self.histograms = {feature_key: {} for feature_key in self.feature_keys}
+        self.feature_weights = {}
+
+        for feature_key in self.feature_keys:
+            feature_support = sum(
+                class_counts.get(1, 0) + class_counts.get(0, 0) for class_counts in counts[feature_key].values()
+            )
+            weighted_discrimination = 0.0
+
+            for value, class_counts in counts[feature_key].items():
+                pos_count = class_counts.get(1, 0)
+                neg_count = class_counts.get(0, 0)
+                support = pos_count + neg_count
+                risk = (pos_count + self.alpha) / (support + 2.0 * self.alpha)
+                self.histograms[feature_key][value] = {
+                    "risk": risk,
+                    "support": float(support),
+                    "n_pos": float(pos_count),
+                    "n_neg": float(neg_count),
+                }
+                if feature_support > 0:
+                    weighted_discrimination += (support / feature_support) * abs(risk - self.P_pos)
+
+            if self.use_feature_weights:
+                self.feature_weights[feature_key] = 1.0 + weighted_discrimination
+            else:
+                self.feature_weights[feature_key] = 1.0
+
+        self.train_time = time.time() - start
+        return self
+
+    def predict(self, row_features: dict[str, str]) -> tuple[int, float]:
+        """Return (predicted_class, averaged_histogram_risk)."""
+        weighted_risk = 0.0
+        total_weight = 0.0
+
+        for feature_key in self.feature_keys:
+            value = str(row_features.get(feature_key, "")).lower()
+            bucket = self.histograms.get(feature_key, {}).get(value)
+            risk = bucket["risk"] if bucket else self.P_pos
+            weight = self.feature_weights.get(feature_key, 1.0)
+            weighted_risk += weight * risk
+            total_weight += weight
+
+        risk = weighted_risk / total_weight if total_weight > 0 else self.P_pos
+        pred = 1 if risk >= self.threshold else 0
+        return pred, risk
+
+    def predict_class(self, row_features: dict[str, str]) -> int:
+        return self.predict(row_features)[0]
+
+    def predict_risk(self, row_features: dict[str, str]) -> float:
+        return self.predict(row_features)[1]
+
+    def feature_importance(self) -> list[tuple[str, float]]:
+        """Return features ordered by histogram discrimination weight."""
+        return sorted(self.feature_weights.items(), key=lambda item: item[1], reverse=True)
+
+HistogramClassifier = HistogramClassifierModel
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # LOGISTIC REGRESSION  (OLS from aggregate counts + optional IRLS refinement)

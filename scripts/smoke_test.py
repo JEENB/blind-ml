@@ -106,6 +106,7 @@ def main() -> int:
                 "LogisticRegressionModel",
                 "GaussianNaiveBayesModel",
                 "BayesianNetworkClassifierModel",
+                "HistogramClassifierModel",
             ],
         ),
     )
@@ -151,6 +152,7 @@ def main() -> int:
             BayesianNetworkClassifierModel,
             GaussianNaiveBayesModel,
             NaiveBayesModel,
+            HistogramClassifierModel,
         )
 
         m = NaiveBayesModel()
@@ -186,7 +188,22 @@ def main() -> int:
         assert pred == 1
         assert risk > 0.5
 
-    check("NaiveBayesModel(), GaussianNaiveBayesModel(), BayesianNetworkClassifierModel()", model_smoke)
+        hist = HistogramClassifierModel().fit(
+            [
+                ("color", 1, "red", 8),
+                ("color", 0, "red", 2),
+                ("color", 1, "blue", 1),
+                ("color", 0, "blue", 9),
+            ],
+            n_pos=9,
+            n_neg=11,
+        )
+        pred, risk = hist.predict({"color": "red"})
+        assert pred == 1
+        assert risk > 0.5
+
+
+    check("NaiveBayesModel(), GaussianNaiveBayesModel(), BayesianNetworkClassifierModel(), HistogramClassifierModel()", model_smoke)
 
     print("\nAll checks passed.")
     return 0
