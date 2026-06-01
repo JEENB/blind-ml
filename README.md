@@ -1,13 +1,15 @@
 # blind-ml — Train ML models on encrypted data
 
-[![Watch Demo Recording](https://i9.ytimg.com/vi/N9VNa7xC_48/mqdefault.jpg?sqp=CIDA5s0G-oaymwEmCMACELQB8quKqQMa8AEB-AH-CYAC0AWKAgwIABABGD8gEyh_MA8=&rs=AOn4CLDpMxVDSvv8_M38H_ROE8uBJrjTAg)](https://www.youtube.com/watch?v=N9VNa7xC_48 "Encrypted Fraud Training")
+[Watch Demo Recording](https://www.youtube.com/watch?v=N9VNa7xC_48)
 
 **Train sklearn-style models on sensitive data that never gets decrypted** — using [Blind Insight](https://blindinsight.com) searchable encryption.
 
-| Notebook | Domain | Models | Scale |
-|----------|--------|--------|-------|
-| [`fraud.ipynb`](fraud.ipynb) | Cross-border fraud (IBANs, jurisdictions, reports) | Naive Bayes, Decision Tree, Logistic Regression | 50K per batch — upload as many batches as you want |
-| [`breast_cancer.ipynb`](breast_cancer.ipynb) | Breast cancer screening risk (HIPAA k=11 binning) | Naive Bayes, Decision Tree, Logistic Regression + Gail/BCSC benchmarks | 20K per batch — upload as many as you want |
+
+| Notebook                                     | Domain                                             | Models                                                                 | Scale                                              |
+| -------------------------------------------- | -------------------------------------------------- | ---------------------------------------------------------------------- | -------------------------------------------------- |
+| `[fraud.ipynb](fraud.ipynb)`                 | Cross-border fraud (IBANs, jurisdictions, reports) | Six Models                                                             | 50K per batch — upload as many batches as you want |
+| `[breast_cancer.ipynb](breast_cancer.ipynb)` | Breast cancer screening risk (HIPAA k=11 binning)  | Naive Bayes, Decision Tree, Logistic Regression + Gail/BCSC benchmarks | 20K per batch — upload as many as you want         |
+
 
 Both demos match their sklearn plaintext counterparts while training **only on encrypted aggregate queries** (no record-level decryption during training).
 
@@ -18,10 +20,10 @@ Both demos match their sklearn plaintext counterparts while training **only on e
 1. Sign up for [Blind Insight](https://app.blindinsight.io) and install the [Blind Proxy](https://docs.blindinsight.io/download/) (`blind` CLI).
 2. Install Python deps and obtain demo data ([generate](#step-2-demo-data) or [download from demo-datasets](https://github.com/blind-insight/demo-datasets/tree/main/datasets/blind-ml)).
 3. Create a BI dataset + train/test schemas and upload JSON batches.
-4. Copy [`.env.example`](.env.example) → `.env` with your email, password, and org slug.
+4. Copy `[.env.example](.env.example)` → `.env` with your email, password, and org slug.
 5. Run **one** notebook and compare encrypted vs plaintext accuracy.
 
-**Time:** ~1–2 hours the first time (proxy setup + upload). After data is indexed, the fraud notebook trains in ~35s locally (~2 min on cloud).
+**Time:** ~~1–2 hours the first time (proxy setup + upload). After data is indexed, the fraud notebook trains in ~35s locally (~~2 min on cloud).
 
 **Prerequisites:** Python 3.11+, Blind Insight account, proxy binary from [docs.blindinsight.io/download](https://docs.blindinsight.io/download).
 
@@ -37,15 +39,18 @@ Official docs: [docs.blindinsight.io](https://docs.blindinsight.io) · Deeper ML
 
 ## Choose a demo
 
-| Start here | Notebook | Best for |
-|------------|----------|----------|
-| **Fraud (recommended)** | [`fraud.ipynb`](fraud.ipynb) | Three algorithms, large-scale financial data, cross-border story |
-| **Healthcare** | [`breast_cancer.ipynb`](breast_cancer.ipynb) | HIPAA, clinical risk models, Gail/BCSC comparison |
+
+| Start here              | Notebook                                     | Best for                                                       |
+| ----------------------- | -------------------------------------------- | -------------------------------------------------------------- |
+| **Fraud (recommended)** | `[fraud.ipynb](fraud.ipynb)`                 | Six algorithms, large-scale financial data, cross-border story |
+| **Healthcare**          | `[breast_cancer.ipynb](breast_cancer.ipynb)` | HIPAA, clinical risk models, Gail/BCSC comparison              |
+
 
 Each demo has its own guide below. Setup is the same pattern; only schemas, generators, and config helpers differ.
 
 **Configuration split:**
-- **`.env`** — shared login: `BI_EMAIL`, `BI_PASSWORD`, `BI_ORG` (see [`.env.example`](.env.example))
+
+- `**.env`** — shared login: `BI_EMAIL`, `BI_PASSWORD`, `BI_ORG` (see `[.env.example](.env.example)`)
 - **Notebook config** — dataset/schema slugs: `get_fraud_demo_config()` in `blind_ml/demo_helpers.py`, `get_bc_demo_config()` in `blind_ml/healthcare.py`
 
 > **Two logins:** `./blind login` configures the proxy CLI/keyring. The notebook uses **HTTP basic auth** from `.env` for API calls — both are required.
@@ -56,12 +61,12 @@ Each demo has its own guide below. Setup is the same pattern; only schemas, gene
 
 ### Prerequisites checklist
 
-- [ ] Blind Insight account; `./blind login` works
-- [ ] `./blind users self` or `./blind organization list` succeeds
-- [ ] Keyring created if first time: `./blind keyring create` ([docs](https://docs.blindinsight.io/getting-started/using-the-blind-proxy/#create-your-keyring))
-- [ ] Proxy running: `./blind proxy` (keep terminal open)
-- [ ] At least one training batch + test batch uploaded to BI (see [Upload data](#upload-data-to-blind-insight) below)
-- [ ] Local SQLite generated: `demo_data/plaintext/fraud_train.db` and `fraud_test.db`
+- Blind Insight account; `./blind login` works
+- `./blind users self` or `./blind organization list` succeeds
+- Keyring created if first time: `./blind keyring create` ([docs](https://docs.blindinsight.io/getting-started/using-the-blind-proxy/#create-your-keyring))
+- Proxy running: `./blind proxy` (keep terminal open)
+- At least one training batch + test batch uploaded to BI (see [Upload data](#upload-data-to-blind-insight) below)
+- Local SQLite generated: `demo_data/plaintext/fraud_train.db` and `fraud_test.db`
 
 ### Step 1: Install Python dependencies
 
@@ -92,7 +97,7 @@ cp /tmp/demo-datasets/datasets/blind-ml/*.json demo_data/upload_batches/
 
 You still need SQLite for plaintext benchmarks — run the generator at least once, or copy matching `.db` files if published alongside the JSON in demo-datasets.
 
-Details: [`demo_data/README.md`](demo_data/README.md).
+Details: `[demo_data/README.md](demo_data/README.md)`.
 
 ### Step 3: Start the Blind Proxy
 
@@ -152,7 +157,7 @@ python -c "import pandas, sklearn; print('OK')"
 
 The notebook loads local SQLite for plaintext benchmarks, trains encrypted models via ~90 aggregate queries, compares F1 to sklearn, runs validation and a realtime demo.
 
-**Expected runtime:** ~35s encrypted training on local BI (~2 min cloud) at full scale; faster with fewer uploaded records.
+**Expected runtime:** ~~35s encrypted training on local BI (~~2 min cloud) at full scale; faster with fewer uploaded records.
 
 ---
 
@@ -208,11 +213,13 @@ Trains Naive Bayes, Decision Tree, and Logistic Regression on encrypted aggregat
 
 Each batch has the **same feature distributions**, so the demo works at any scale:
 
-| Fraud | Batch size | Upload |
-|-------|------------|--------|
-| Quick try | 1 train + 1 test file | ~50K train records |
-| Partial | Any subset of `fraud_train_batch_*.json` | Your choice |
+
+| Fraud              | Batch size                                  | Upload                        |
+| ------------------ | ------------------------------------------- | ----------------------------- |
+| Quick try          | 1 train + 1 test file                       | ~50K train records            |
+| Partial            | Any subset of `fraud_train_batch_*.json`    | Your choice                   |
 | Full generated set | All train batches + test (+ optional noise) | Up to ~600K train / ~54K test |
+
 
 Upload **as many training batches as you want** — whatever your account and patience allow. The notebook compares against the local SQLite mirror, which includes the full generated dataset regardless of how much you uploaded to BI.
 
@@ -279,7 +286,7 @@ blind jobs upload --data demo_data/upload_batches/fraud_train_batch_01.json
 
 If uploads don't land via the local proxy, use Method 2 ([known issue with `--host` routing](https://docs.blindinsight.io/getting-started/uploading-data/)).
 
-More detail: [`demo_data/README.md`](demo_data/README.md) · [Uploading data docs](https://docs.blindinsight.io/getting-started/uploading-data/)
+More detail: `[demo_data/README.md](demo_data/README.md)` · [Uploading data docs](https://docs.blindinsight.io/getting-started/uploading-data/)
 
 ---
 
@@ -313,11 +320,13 @@ Blind Insight uses **two keys per field**: a query key (search/aggregate) and a 
                                               └───────────────────┘
 ```
 
-| Traditional ML | Blind Insight ML |
-|----------------|------------------|
-| Data decrypted for training | Data stays encrypted |
-| Raw records exposed | Only aggregates returned |
-| Siloed by compliance | Cross-org collaboration on encrypted data |
+
+| Traditional ML              | Blind Insight ML                          |
+| --------------------------- | ----------------------------------------- |
+| Data decrypted for training | Data stays encrypted                      |
+| Raw records exposed         | Only aggregates returned                  |
+| Siloed by compliance        | Cross-org collaboration on encrypted data |
+
 
 **Data integrity:** Local SQLite (`scripts/generate_fraud_data.py`) matches upload batches record-for-record. BI is the source of truth for encrypted training; SQLite is for plaintext comparison only.
 
@@ -325,16 +334,21 @@ Blind Insight uses **two keys per field**: a query key (search/aggregate) and a 
 
 ## Fraud notebook walkthrough
 
-| Section | What it does |
-|---------|----------------|
-| Load data | SQLite mirror + proxy warm-up |
-| Train Naive Bayes | ~90 BI aggregate queries vs plaintext NB |
-| Train Decision Tree | Gini/CART from counts; sklearn comparison |
-| Train Logistic Regression | OLS from X'X, X'y + IRLS |
-| Three-model comparison | F1, sensitivity, specificity, confusion matrices |
-| Real-time demo | Encrypted vs decrypted side-by-side |
-| Test validation | Encrypted vs plaintext on held-out records |
-| Scaling calculator | Plaintext vs BI vs FHE extrapolation |
+
+| Section                    | What it does                                                                                          |
+| -------------------------- | ----------------------------------------------------------------------------------------------------- |
+| Load data                  | SQLite mirror + proxy warm-up                                                                         |
+| Train Naive Bayes          | ~90 BI aggregate queries vs plaintext NB                                                              |
+| Train Gaussian Naive Bayes | ~96 value-count queries on month/day/year; class-conditional means & variance vs sklearn GaussianNB   |
+| Train Bayesian Network     | ~514 multi-filter CPT queries (P(feature                                                              |
+| Train Decision Tree        | Gini/CART from counts; sklearn comparison                                                             |
+| Train Logistic Regression  | OLS from X'X, X'y + IRLS                                                                              |
+| Train Histogram Classifier | ~90 class-conditional marginal counts → per-value risk buckets; vs same algorithm on plaintext mirror |
+| Six-model comparison       | F1, sensitivity, specificity, confusion matrices                                                      |
+| Real-time demo             | Encrypted vs decrypted side-by-side                                                                   |
+| Test validation            | Encrypted vs plaintext on held-out records                                                            |
+| Scaling calculator         | Plaintext vs BI vs FHE extrapolation                                                                  |
+
 
 ### Live demo tips
 
@@ -348,16 +362,26 @@ Blind Insight uses **two keys per field**: a query key (search/aggregate) and a 
 
 Validated at ~600K train / ~54K test when all batches are uploaded and generated locally:
 
-| Model | sklearn F1 | Encrypted F1 | BI queries | Data decrypted |
-|-------|-----------|-------------|------------|----------------|
-| Naive Bayes | 0.942 | 0.942 | ~90 | Never |
-| Decision Tree | 0.942 | 0.942 | 0 (reuses NB) | Never |
-| Logistic Regression | 0.942 | 0.942 | 0 (reuses NB) | Never |
 
-| Aspect | Plaintext | Blind Insight |
-|--------|-----------|---------------|
-| NB training | ~0.01s | ~35s local / ~2min cloud |
-| DT / LR | ~1–3s each | Seconds (local math on NB counts) |
+| Model                | sklearn F1 | Encrypted F1 | BI queries    | Data decrypted |
+| -------------------- | ---------- | ------------ | ------------- | -------------- |
+| Naive Bayes          | 0.942      | 0.942        | ~90           | Never          |
+| Decision Tree        | 0.942      | 0.942        | 0 (reuses NB) | Never          |
+| Logistic Regression  | 0.942      | 0.942        | 0 (reuses NB) | Never          |
+| Gaussian Naive Bayes | 0.789      | 0.789        | ~96           | Never          |
+| Bayesian Network     | 1.000      | 1.000        | ~514          | Never          |
+| Histogram Classifier | 0.789      | 0.884        | ~90           | Never          |
+
+
+
+| Aspect           | Plaintext  | Blind Insight                     |
+| ---------------- | ---------- | --------------------------------- |
+| NB training      | ~0.01s     | ~35s local / ~2min cloud          |
+| DT / LR          | ~1–3s each | Seconds (local math on NB counts) |
+| Gaussian NB      | ~0.2s      | ~                                 |
+| Bayesian Network | ~1.2s      | ~                                 |
+| Histogram        | ~3.4s      | ~                                 |
+
 
 Training time scales sub-linearly with record count — doubling rows does not double query time. See [APPROACH.md](APPROACH.md) for algorithms, query syntax, and extension ideas.
 
@@ -412,22 +436,24 @@ Training uses parallel queries; if timeouts persist, check proxy health and netw
 
 ## File reference
 
-| File | Purpose |
-|------|---------|
-| `fraud.ipynb` | Fraud demo (NB + DT + LR) |
-| `breast_cancer.ipynb` | Healthcare risk demo |
-| `blind_ml/` | Client, models, demo helpers |
-| `blind_ml/demo_helpers.py` | `get_fraud_demo_config()`, fraud training UI |
-| `blind_ml/healthcare.py` | `get_bc_demo_config()`, BC training |
-| `scripts/generate_fraud_data.py` | Fraud SQLite + JSON batches |
-| `scripts/generate_healthcare_data.py` | BC SQLite + JSON batches |
-| `scripts/upload_bc_batches.py` | Serial BC upload helper |
-| `schemas/fraud.json` / `schemas/breast_cancer.json` | BI schema definitions |
-| `demo_data/` | Placeholder dirs for generated/uploaded data (see [demo-datasets](https://github.com/blind-insight/demo-datasets)) |
-| `.cursor/` | Contributor rules and skills for Cursor (optional) |
-| `.env.example` | Credential template |
-| `APPROACH.md` | Algorithms, architecture, contribution guide |
-| `scripts/smoke_test.py` | Import + config validation (`python3 scripts/smoke_test.py`) |
+
+| File                                                | Purpose                                                                                                            |
+| --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `fraud.ipynb`                                       | Fraud demo (NB + DT + LR)                                                                                          |
+| `breast_cancer.ipynb`                               | Healthcare risk demo                                                                                               |
+| `blind_ml/`                                         | Client, models, demo helpers                                                                                       |
+| `blind_ml/demo_helpers.py`                          | `get_fraud_demo_config()`, fraud training UI                                                                       |
+| `blind_ml/healthcare.py`                            | `get_bc_demo_config()`, BC training                                                                                |
+| `scripts/generate_fraud_data.py`                    | Fraud SQLite + JSON batches                                                                                        |
+| `scripts/generate_healthcare_data.py`               | BC SQLite + JSON batches                                                                                           |
+| `scripts/upload_bc_batches.py`                      | Serial BC upload helper                                                                                            |
+| `schemas/fraud.json` / `schemas/breast_cancer.json` | BI schema definitions                                                                                              |
+| `demo_data/`                                        | Placeholder dirs for generated/uploaded data (see [demo-datasets](https://github.com/blind-insight/demo-datasets)) |
+| `.cursor/`                                          | Contributor rules and skills for Cursor (optional)                                                                 |
+| `.env.example`                                      | Credential template                                                                                                |
+| `APPROACH.md`                                       | Algorithms, architecture, contribution guide                                                                       |
+| `scripts/smoke_test.py`                             | Import + config validation (`python3 scripts/smoke_test.py`)                                                       |
+
 
 ---
 
