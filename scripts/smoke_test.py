@@ -151,8 +151,8 @@ def main() -> int:
         from blind_ml import (
             BayesianNetworkClassifierModel,
             GaussianNaiveBayesModel,
-            NaiveBayesModel,
             HistogramClassifierModel,
+            NaiveBayesModel,
         )
 
         m = NaiveBayesModel()

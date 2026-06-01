@@ -27,6 +27,9 @@ from .models import (
     GaussianNaiveBayesModel as _GaussianNaiveBayesModel,
 )
 from .models import (
+    HistogramClassifierModel as _HistogramClassifierModel,
+)
+from .models import (
     LogisticRegressionModel as _LogisticRegressionModel,
 )
 from .models import (
@@ -40,9 +43,6 @@ from .models import (
 )
 from .models import (
     compute_pairwise_local as _compute_pairwise_local,
-)
-from .models import (
-    HistogramClassifierModel as _HistogramClassifierModel,
 )
 
 # =============================================================================
