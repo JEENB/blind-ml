@@ -918,6 +918,7 @@ class DecisionTreeModel:
     def predict_batch(self, df: pd.DataFrame) -> list[tuple[int, float]]:
         return [self.predict(row.to_dict()) for _, row in df.iterrows()]
 
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # HISTOGRAM CLASSIFIER
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1040,6 +1041,7 @@ class HistogramClassifierModel:
     def feature_importance(self) -> list[tuple[str, float]]:
         """Return features ordered by histogram discrimination weight."""
         return sorted(self.feature_weights.items(), key=lambda item: item[1], reverse=True)
+
 
 HistogramClassifier = HistogramClassifierModel
 

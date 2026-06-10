@@ -765,6 +765,7 @@ def discover_feature_values(df: pd.DataFrame) -> dict[str, list[str]]:
         "year_values": sorted(df["year"].astype(str).unique().tolist(), key=lambda x: int(x)),
     }
 
+
 def _fraud_marginal_count_queries(values: dict[str, list[str]]) -> list[tuple[str, int, str, str]]:
     """Build class-split marginal count queries shared by count-only models."""
     queries = []

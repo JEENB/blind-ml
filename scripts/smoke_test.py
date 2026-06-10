@@ -202,8 +202,10 @@ def main() -> int:
         assert pred == 1
         assert risk > 0.5
 
-
-    check("NaiveBayesModel(), GaussianNaiveBayesModel(), BayesianNetworkClassifierModel(), HistogramClassifierModel()", model_smoke)
+    check(
+        "NaiveBayesModel(), GaussianNaiveBayesModel(), BayesianNetworkClassifierModel(), HistogramClassifierModel()",
+        model_smoke,
+    )
 
     print("\nAll checks passed.")
     return 0
