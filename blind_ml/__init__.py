@@ -1,9 +1,14 @@
 """blind_ml — train sklearn-style models on encrypted data via Blind Insight."""
 
 from .models import (
+    AdaBoostStumpModel,
+    BayesianNetworkClassifierModel,
     DecisionTreeModel,
+    GaussianNaiveBayesModel,
+    HistogramClassifierModel,
     LogisticRegressionModel,
     NaiveBayesModel,
+    RandomForestModel,
     apply_platt,
     build_design_matrix,
     build_dummy_index,
@@ -20,6 +25,11 @@ __all__ = [
     "NaiveBayesModel",
     "DecisionTreeModel",
     "LogisticRegressionModel",
+    "GaussianNaiveBayesModel",
+    "BayesianNetworkClassifierModel",
+    "HistogramClassifierModel",
+    "RandomForestModel",
+    "AdaBoostStumpModel",
     "gini",
     "entropy",
     "build_marginals_local",

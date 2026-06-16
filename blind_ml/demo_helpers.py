@@ -10,6 +10,7 @@ import os
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
+from itertools import combinations, product
 from pathlib import Path
 from typing import Any
 
@@ -17,10 +18,28 @@ import numpy as np
 import pandas as pd
 
 from .models import (
+    AdaBoostStumpModel as _AdaBoostStumpModel,
+)
+from .models import (
+    BayesianNetworkClassifierModel as _BayesianNetworkClassifierModel,
+)
+from .models import (
     DecisionTreeModel as _DecisionTreeModel,
 )
 from .models import (
+    GaussianNaiveBayesModel as _GaussianNaiveBayesModel,
+)
+from .models import (
+    HistogramClassifierModel as _HistogramClassifierModel,
+)
+from .models import (
     LogisticRegressionModel as _LogisticRegressionModel,
+)
+from .models import (
+    RandomForestModel as _RandomForestModel,
+)
+from .models import (
+    build_bayesian_cpt_counts_local as _build_bayesian_cpt_counts_local,
 )
 from .models import (
     build_design_matrix as _build_design_matrix,
@@ -1070,7 +1089,8 @@ def train_plaintext_nb(df: pd.DataFrame, feature_values: dict[str, list[str]]):
     }
 
 
-def naive_bayes_predict(P_high, P_low, P_tables, row) -> int:
+def _naive_bayes_log_posteriors(P_high, P_low, P_tables, row) -> tuple[float, float]:
+    """Return unnormalized log posteriors (log P(high|x), log P(low|x)) for one row."""
     eps = 1e-10
     ft = str(row["fraud_type"]).lower()
     jur = str(row["account_jurisdiction"]).lower()
@@ -1096,7 +1116,20 @@ def naive_bayes_predict(P_high, P_low, P_tables, row) -> int:
     log_l += math.log(max(P_month[0].get(mon, 0.1), eps))
     log_l += math.log(max(P_bank[0].get(bank, 0.1), eps))
     log_l += math.log(max(P_year[0].get(year, 0.1), eps))
+    return log_h, log_l
 
+
+def naive_bayes_predict_proba(P_high, P_low, P_tables, row) -> float:
+    """Return P(high_risk | row) from Naive Bayes probability tables."""
+    log_h, log_l = _naive_bayes_log_posteriors(P_high, P_low, P_tables, row)
+    max_log = max(log_h, log_l)
+    num = math.exp(log_h - max_log)
+    den = num + math.exp(log_l - max_log)
+    return num / den if den > 0 else 0.5
+
+
+def naive_bayes_predict(P_high, P_low, P_tables, row) -> int:
+    log_h, log_l = _naive_bayes_log_posteriors(P_high, P_low, P_tables, row)
     return 1 if log_h > log_l else 0
 
 
@@ -1392,8 +1425,13 @@ def training_summary_table(
     enc_queries: int,
     enc_train_time: float,
     plain_train_time: float,
+    plain_queries: int = 0,
 ) -> str:
-    """Build the training comparison table (Plaintext vs Blind Insight)."""
+    """Build the training comparison table (Plaintext vs Blind Insight).
+
+    ``plain_queries`` is BI/HTTP aggregate calls for the plaintext path (usually 0
+    for local SQLite training). ``enc_queries`` is the encrypted path only.
+    """
     overhead = enc_train_time - plain_train_time
     overhead_class = "status-good" if overhead < 180 else "status-bad"
     return metrics_table(
@@ -1401,7 +1439,7 @@ def training_summary_table(
             {"label": "High Risk", "values": [f"{n_high_plain:,}", f"{n_high_enc:,}", "-"]},
             {"label": "Low Risk", "values": [f"{n_low_plain:,}", f"{n_low_enc:,}", "-"]},
             {"label": "Total", "values": [f"{n_high_plain + n_low_plain:,}", f"{n_high_enc + n_low_enc:,}", "-"]},
-            {"label": "Queries", "values": [str(enc_queries), str(enc_queries), "-"]},
+            {"label": "Queries", "values": [str(plain_queries), str(enc_queries), "-"]},
             {
                 "label": "Train Time",
                 "values": [f"{plain_train_time:.6f}s", f"{enc_train_time:.1f}s", f"+{overhead:.1f}s"],
@@ -1597,8 +1635,7 @@ def _fraud_row_features(row: dict) -> dict[str, str]:
 
 
 # Maps the ``feat_type`` strings used in ``raw_results`` tuples (produced by
-# ``_bi_queries``) back to the actual DataFrame column names. Used by
-# ``run_encrypted_dt_fraud`` to feed BI counts into the tree's root split.
+# ``_bi_queries``) back to fraud column names for the DT aggregate query cache.
 _FRAUD_FEAT_TYPE_TO_COLUMN = {
     "fraud": "fraud_type",
     "jur": "account_jurisdiction",
@@ -1609,58 +1646,224 @@ _FRAUD_FEAT_TYPE_TO_COLUMN = {
 }
 
 
-def run_encrypted_dt_fraud(
-    raw_results: list[tuple],
+def _fraud_dt_feature_values(feature_values: dict[str, list[str]]) -> dict[str, list[str]]:
+    """Return DecisionTreeModel feature values keyed by fraud column name."""
+    values_by_feature: dict[str, list[str]] = {}
+    for feature, (values_key, _field_name) in _FRAUD_FEATURE_MAP.items():
+        seen: set[str] = set()
+        values_by_feature[feature] = []
+        for raw_value in feature_values.get(values_key, []):
+            value = str(raw_value).lower()
+            if value in seen:
+                continue
+            seen.add(value)
+            values_by_feature[feature].append(value)
+    return values_by_feature
+
+
+def _fraud_dt_wire_values(feature_values: dict[str, list[str]]) -> dict[str, dict[str, str]]:
+    """Map normalized DT values back to the exact BI token wire values."""
+    wire_values: dict[str, dict[str, str]] = {}
+    for feature, (values_key, _field_name) in _FRAUD_FEATURE_MAP.items():
+        wire_values[feature] = {}
+        for raw_value in feature_values.get(values_key, []):
+            wire_values[feature][str(raw_value).lower()] = str(raw_value)
+    return wire_values
+
+
+def _build_fraud_dt_count_provider(
+    client,
+    org: str,
+    dataset: str,
+    schema: str,
     feature_values: dict[str, list[str]],
-    df_local: pd.DataFrame,
-    n_high: int,
-    n_low: int,
+    raw_results: list[tuple] | None = None,
+    aggregate_cache: dict[str, int] | None = None,
+):
+    """Create a generic DecisionTreeModel count_fn backed by BI aggregates."""
+    dt_feature_values = _fraud_dt_feature_values(feature_values)
+    wire_values = _fraud_dt_wire_values(feature_values)
+    aggregate_cache = aggregate_cache if aggregate_cache is not None else {}
+    split_cache: dict[tuple[tuple[tuple[str, str, bool], ...], str, str, int], int] = {}
+    query_counter = {"n": 0}
+
+    def _class_filter(cls: int) -> str:
+        return "risk_level:count(50~100)" if int(cls) == 1 else "risk_level:count(0~49)"
+
+    if raw_results:
+        for feat_type, cls, raw_value, count in raw_results:
+            feature = _FRAUD_FEAT_TYPE_TO_COLUMN.get(str(feat_type))
+            if feature is None:
+                continue
+            norm_value = str(raw_value).lower()
+            count = int(count)
+            key = (tuple(), feature, norm_value, int(cls))
+            split_cache[key] = count
+            field_name = _FRAUD_FEATURE_MAP[feature][1]
+            wire_value = wire_values.get(feature, {}).get(norm_value, str(raw_value))
+            aggregate_cache[f"{_class_filter(cls)},{field_name}:{wire_value}"] = count
+
+    def _aggregate(filters: list[str]) -> int:
+        query = ",".join(filters)
+        if query not in aggregate_cache:
+            aggregate_cache[query] = get_encrypted_count(client, org, dataset, schema, query)
+            query_counter["n"] += 1
+        return aggregate_cache[query]
+
+    def _allowed_values(path: tuple[tuple[str, str, bool], ...]) -> dict[str, set[str]]:
+        allowed = {feature: set(values) for feature, values in dt_feature_values.items()}
+        for feature, value, branch in path:
+            if feature not in allowed:
+                return {}
+            norm_value = str(value).lower()
+            if branch:
+                allowed[feature] &= {norm_value}
+            else:
+                allowed[feature].discard(norm_value)
+        return allowed
+
+    def _path_constraints(
+        path: tuple[tuple[str, str, bool], ...],
+    ) -> tuple[dict[str, str], list[tuple[str, str]], bool]:
+        equalities: dict[str, str] = {}
+        exclusions: list[tuple[str, str]] = []
+        for feature, raw_value, branch in path:
+            value = str(raw_value).lower()
+            if value not in dt_feature_values.get(feature, []):
+                return {}, [], False
+            if branch:
+                existing = equalities.get(feature)
+                if existing is not None and existing != value:
+                    return {}, [], False
+                equalities[feature] = value
+            else:
+                exclusions.append((feature, value))
+
+        for feature, value in exclusions:
+            if equalities.get(feature) == value:
+                return {}, [], False
+        return equalities, exclusions, True
+
+    def _query_count(equalities: dict[str, str], class_label: int) -> int:
+        filters = [_class_filter(class_label)]
+        for feature in _FRAUD_FEATURES_ORDERED:
+            if feature not in equalities:
+                continue
+            field_name = _FRAUD_FEATURE_MAP[feature][1]
+            value = equalities[feature]
+            wire_value = wire_values.get(feature, {}).get(value, value)
+            filters.append(f"{field_name}:{wire_value}")
+        return _aggregate(filters)
+
+    def _count_with_exclusions(
+        equalities: dict[str, str],
+        exclusions: list[tuple[str, str]],
+        class_label: int,
+    ) -> int:
+        total = 0
+        n_exclusions = len(exclusions)
+        for size in range(n_exclusions + 1):
+            sign = -1 if size % 2 else 1
+            for subset in combinations(exclusions, size):
+                terms = dict(equalities)
+                impossible = False
+                for feature, value in subset:
+                    existing = terms.get(feature)
+                    if existing is not None and existing != value:
+                        impossible = True
+                        break
+                    terms[feature] = value
+                if impossible:
+                    continue
+                total += sign * _query_count(terms, class_label)
+        return max(0, total)
+
+    def count_fn(
+        path: tuple[tuple[str, str, bool], ...],
+        feature: str,
+        value: str,
+        class_label: int,
+    ) -> int:
+        norm_path = tuple((f, str(v).lower(), bool(branch)) for f, v, branch in path)
+        norm_value = str(value).lower()
+        key = (norm_path, feature, norm_value, int(class_label))
+        if key in split_cache:
+            return split_cache[key]
+
+        allowed = _allowed_values(norm_path + ((feature, norm_value, True),))
+        if not allowed or any(len(values) == 0 for values in allowed.values()):
+            split_cache[key] = 0
+            return 0
+
+        equalities, exclusions, possible = _path_constraints(norm_path + ((feature, norm_value, True),))
+        total = _count_with_exclusions(equalities, exclusions, class_label) if possible else 0
+        split_cache[key] = total
+        return total
+
+    return count_fn, lambda: query_counter["n"], dt_feature_values, aggregate_cache
+
+
+def run_encrypted_dt_fraud(
+    feature_values: dict[str, list[str]],
+    client,
+    org: str,
+    dataset: str,
+    schema: str,
+    raw_results: list[tuple] | None = None,
+    n_high: int | None = None,
+    n_low: int | None = None,
     max_depth: int = 3,
     k_min: int = 0,
     criterion: str = "gini",
+    max_workers: int = 10,
 ) -> dict[str, Any]:
-    """Build a decision tree whose ROOT split uses encrypted aggregate counts.
+    """Build a fraud decision tree entirely from encrypted aggregate counts."""
+    if not feature_values:
+        raise ValueError("run_encrypted_dt_fraud requires feature_values.")
+    if client is None or not org or not dataset or not schema:
+        raise ValueError("run_encrypted_dt_fraud requires BI client/org/dataset/schema.")
 
-    The root split is chosen from ``raw_results`` (encrypted BI marginal counts
-    returned by ``run_bi_training``) using only ``n_high`` / ``n_low`` from BI
-    base rates as the class totals. Deeper splits are computed from the local
-    plaintext mirror — see APPROACH.md, "root from BI marginals, deeper from
-    local cross-tabs." Zero additional BI queries beyond what NB already
-    fetched.
-    """
-    if not raw_results:
-        raise ValueError(
-            "run_encrypted_dt_fraud requires raw_results from run_bi_training. "
-            "Got an empty list — did NB training run? Pass bi['raw_results']."
-        )
+    raw_results_source = "provided"
+    base_rate_queries = 0
+
+    if n_high is None or n_low is None:
+        n_high, n_low = get_bi_base_rates(client, org, dataset, schema)
+        base_rate_queries = 2
+    if raw_results is None:
+        queries = _bi_queries(feature_values)
+
+        def run_query(q):
+            f_type, r_class, val, q_str = q
+            count = get_encrypted_count(client, org, dataset, schema, q_str)
+            return (f_type, r_class, val, count)
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            raw_results = list(executor.map(run_query, queries))
+        raw_results_source = "dt_rerun"
+
     if n_high + n_low == 0:
         raise ValueError(
             "run_encrypted_dt_fraud requires non-zero BI base rates. "
             "Got n_high=n_low=0 — check that BI ingest completed."
         )
 
-    df = df_local.copy()
-    df["is_high_risk"] = (df["risk_level"].astype(int) >= 50).astype(int)
-
-    # Case normalization: raw_results values come from `_bi_queries`, which
-    # mixes lowercased (fraud_type, jur, active) and original-case (bank_id,
-    # month, year) values. pd.get_dummies builds column names from the df's
-    # actual values. To make `f"{col}_{val}"` align on both sides, lowercase
-    # both the local df values AND the raw_results values uniformly.
-    for col in _FRAUD_FEATURES_ORDERED:
-        df[col] = df[col].astype(str).str.lower()
-    raw_results = [(ft, cls, str(val).lower(), cnt) for ft, cls, val, cnt in raw_results]
-
-    dt = _DecisionTreeModel(max_depth=max_depth, criterion=criterion, k_min=k_min)
-    dt.fit_with_bi_root(
+    count_fn, query_count, dt_feature_values, aggregate_cache = _build_fraud_dt_count_provider(
+        client=client,
+        org=org,
+        dataset=dataset,
+        schema=schema,
+        feature_values=feature_values,
         raw_results=raw_results,
-        feat_type_to_column=_FRAUD_FEAT_TYPE_TO_COLUMN,
-        df=df,
-        feature_columns=_FRAUD_FEATURES_ORDERED,
-        target_col="is_high_risk",
+    )
+    dt = _DecisionTreeModel(max_depth=max_depth, criterion=criterion, k_min=k_min)
+    dt.fit_from_counts(
+        count_fn=count_fn,
+        feature_values=dt_feature_values,
         n_pos=n_high,
         n_neg=n_low,
     )
+    if dt.tree is not None:
+        dt.tree["bi_counts"] = True
 
     return {
         "_model": dt,
@@ -1672,8 +1875,18 @@ def run_encrypted_dt_fraud(
         "train_time": dt.train_time,
         "criterion": criterion,
         "root_feat": dt.tree.get("col_name") if dt.tree and dt.tree.get("type") == "split" else None,
-        "root_gain": dt.tree.get("bi_root_gain", 0) if dt.tree else 0,
-        "root_from_bi": dt.tree.get("bi_root", False) if dt.tree else False,
+        "root_gain": dt.tree.get("gain", 0) if dt.tree else 0,
+        "root_from_bi": True,
+        "counts_from_bi": True,
+        "enc_queries": len(raw_results) + query_count(),
+        "base_rate_queries": base_rate_queries,
+        "total_aggregate_calls": len(raw_results) + query_count() + base_rate_queries,
+        "raw_results_source": raw_results_source,
+        "additional_dt_queries": query_count(),
+        "raw_results": raw_results,
+        "query_cache": aggregate_cache,
+        "n_high": n_high,
+        "n_low": n_low,
         "root_children": {},
         "tree_nodes": {},
     }
@@ -1693,6 +1906,28 @@ def fraud_dt_predict(dt_result: dict, row: dict) -> tuple[int, float]:
         if col in row_normalized:
             row_normalized[col] = str(row_normalized[col]).lower()
     return model.predict(row_normalized)
+
+
+def fraud_dt_describe(dt_result: dict) -> str:
+    """Return a readable text description of the fraud Decision Tree."""
+    model = dt_result.get("_model")
+    if not model or not model.tree:
+        return "Empty tree"
+
+    def _desc(node: dict, indent: int = 0) -> list[str]:
+        pre = "  " * indent
+        if node["type"] == "leaf":
+            return [f"{pre}-> risk={node['risk']:.4f} (n={node['n']:,}, pos={node['n_pos']:,}, neg={node['n_neg']:,})"]
+
+        gain = node.get("gain", node.get("bi_root_gain", 0.0))
+        lines = [f"{pre}{node['col_name']}? gain={gain:.4f} (n={node['n']:,})"]
+        lines.append(f"{pre}  YES:")
+        lines.extend(_desc(node["left"], indent + 2))
+        lines.append(f"{pre}  NO:")
+        lines.extend(_desc(node["right"], indent + 2))
+        return lines
+
+    return "\n".join(_desc(model.tree))
 
 
 def train_plaintext_dt_fraud(
@@ -1741,6 +1976,416 @@ def fraud_plaintext_predict_proba(
     proba = model.predict_proba(X_encoded)
     pos_idx = list(model.classes_).index(1) if 1 in model.classes_ else 0
     return [float(p[pos_idx]) for p in proba]
+
+
+# =============================================================================
+# ENCRYPTED RANDOM FOREST (fraud)
+# =============================================================================
+
+
+def _run_fraud_marginal_queries(
+    client,
+    org: str,
+    dataset: str,
+    schema: str,
+    feature_values: dict[str, list[str]],
+    max_workers: int = 10,
+) -> list[tuple]:
+    """Fetch fraud class-split marginal counts from BI."""
+    queries = _bi_queries(feature_values)
+
+    def run_query(q):
+        f_type, r_class, val, q_str = q
+        count = get_encrypted_count(client, org, dataset, schema, q_str)
+        return (f_type, r_class, val, count)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        return list(executor.map(run_query, queries))
+
+
+def run_encrypted_rf_fraud(
+    feature_values: dict[str, list[str]] | None = None,
+    dt_result: dict | None = None,
+    raw_results: list[tuple] | None = None,
+    n_high: int | None = None,
+    n_low: int | None = None,
+    n_estimators: int = 7,
+    max_depth: int = 3,
+    max_features: int | float | str | None = 4,
+    criterion: str = "gini",
+    k_min: int = 0,
+    random_state: int | None = 42,
+    client=None,
+    org: str | None = None,
+    dataset: str | None = None,
+    schema: str | None = None,
+    max_workers: int = 10,
+) -> dict[str, Any]:
+    """Train a fraud Random Forest from encrypted aggregate counts.
+
+    ``dt_result`` is optional. When provided, RF reuses its raw marginals,
+    base-rate counts, and aggregate query cache. When omitted, this helper
+    reruns the needed BI aggregate queries so the model cell can run alone.
+    """
+    if not feature_values:
+        if dt_result and dt_result.get("feature_values"):
+            feature_values = dt_result["feature_values"]
+        else:
+            raise ValueError("run_encrypted_rf_fraud requires feature_values or dt_result with feature_values.")
+
+    has_bi_context = client is not None and org and dataset and schema
+    if not has_bi_context:
+        raise ValueError("run_encrypted_rf_fraud requires BI client/org/dataset/schema.")
+
+    raw_results_source = "provided" if raw_results is not None else "rf_rerun"
+    base_rate_queries = 0
+    marginal_queries = 0
+    initial_cache: dict[str, int] = {}
+
+    if dt_result:
+        raw_results = raw_results if raw_results is not None else dt_result.get("raw_results")
+        n_high = n_high if n_high is not None else dt_result.get("n_high")
+        n_low = n_low if n_low is not None else dt_result.get("n_low")
+        initial_cache = dict(dt_result.get("query_cache", {}))
+        raw_results_source = "dt_result" if raw_results is not None else raw_results_source
+
+    if n_high is None or n_low is None:
+        n_high, n_low = get_bi_base_rates(client, org, dataset, schema)
+        base_rate_queries = 2
+    if raw_results is None:
+        raw_results = _run_fraud_marginal_queries(
+            client,
+            org,
+            dataset,
+            schema,
+            feature_values,
+            max_workers=max_workers,
+        )
+        marginal_queries = len(raw_results)
+        raw_results_source = "rf_rerun"
+
+    count_fn, query_count, rf_feature_values, aggregate_cache = _build_fraud_dt_count_provider(
+        client=client,
+        org=org,
+        dataset=dataset,
+        schema=schema,
+        feature_values=feature_values,
+        raw_results=raw_results,
+        aggregate_cache=initial_cache,
+    )
+
+    model = _RandomForestModel(
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        criterion=criterion,
+        k_min=k_min,
+        max_features=max_features,
+        random_state=random_state,
+    ).fit_from_counts(
+        count_fn=count_fn,
+        feature_values=rf_feature_values,
+        n_pos=n_high,
+        n_neg=n_low,
+    )
+
+    additional_rf_queries = query_count()
+    enc_queries = marginal_queries + additional_rf_queries
+    return {
+        "_model": model,
+        "trees": [tree.tree for tree in model.estimators_],
+        "feature_subsets": model.feature_subsets_,
+        "feature_values": feature_values,
+        "raw_results": raw_results,
+        "raw_results_source": raw_results_source,
+        "query_cache": aggregate_cache,
+        "counts_from_bi": True,
+        "n_high": n_high,
+        "n_low": n_low,
+        "n_estimators": n_estimators,
+        "max_depth": max_depth,
+        "max_features": max_features,
+        "criterion": criterion,
+        "train_time": model.train_time,
+        "enc_queries": enc_queries,
+        "base_rate_queries": base_rate_queries,
+        "marginal_queries": marginal_queries,
+        "additional_rf_queries": additional_rf_queries,
+        "total_aggregate_calls": enc_queries + base_rate_queries,
+        "reused_cache_entries": len(initial_cache),
+    }
+
+
+def fraud_rf_predict(rf_result: dict, row: dict) -> tuple[int, float]:
+    """Predict using the encrypted fraud Random Forest."""
+    model = rf_result.get("_model")
+    if not model:
+        return 0, 0.0
+    row_normalized = dict(row)
+    for col in _FRAUD_FEATURES_ORDERED:
+        if col in row_normalized:
+            row_normalized[col] = str(row_normalized[col]).lower()
+    return model.predict(row_normalized)
+
+
+def fraud_rf_describe(rf_result: dict, max_trees: int = 3) -> str:
+    """Return a compact text description of the fraud Random Forest."""
+    model = rf_result.get("_model")
+    if not model or not model.estimators_:
+        return "Empty forest"
+
+    lines = [
+        f"Random Forest: {len(model.estimators_)} trees, max_depth={model.max_depth}, max_features={model.max_features}"
+    ]
+    for idx, (tree, subset) in enumerate(zip(model.estimators_[:max_trees], model.feature_subsets_[:max_trees]), 1):
+        lines.append(f"\nTree {idx} features: {', '.join(subset)}")
+        lines.append(fraud_dt_describe({"_model": tree}))
+    if len(model.estimators_) > max_trees:
+        lines.append(f"\n... {len(model.estimators_) - max_trees} more trees")
+    return "\n".join(lines)
+
+
+def train_plaintext_rf_fraud(
+    df: pd.DataFrame,
+    feature_values: dict[str, list[str]],
+    n_estimators: int = 7,
+    max_depth: int = 3,
+    max_features: int | float | str | None = 4,
+    random_state: int = 42,
+) -> dict[str, Any]:
+    """Train a sklearn RandomForestClassifier on fraud data."""
+    from sklearn.ensemble import RandomForestClassifier
+
+    start = time.time()
+    df2 = df.copy()
+    df2["is_high_risk"] = (df2["risk_level"].astype(int) >= 50).astype(int)
+
+    features = list(_FRAUD_FEATURE_MAP.keys())
+    X = df2[features].copy()
+    for col in features:
+        X[col] = X[col].astype(str)
+    X_encoded = pd.get_dummies(X, columns=features, drop_first=False)
+    col_names = X_encoded.columns.tolist()
+    y = df2["is_high_risk"]
+
+    model = RandomForestClassifier(
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        max_features=max_features,
+        random_state=random_state,
+    )
+    model.fit(X_encoded, y)
+    return {"model": model, "col_names": col_names, "train_time": time.time() - start}
+
+
+def fraud_plaintext_rf_predict_proba(
+    model,
+    col_names: list[str],
+    df_test: pd.DataFrame,
+    feature_values: dict[str, list[str]],
+) -> list[float]:
+    """Predict P(high_risk) using a trained sklearn RandomForestClassifier."""
+    return fraud_plaintext_predict_proba(model, col_names, df_test, feature_values)
+
+
+# =============================================================================
+# ENCRYPTED ADABOOST (fraud)
+# =============================================================================
+
+
+def run_encrypted_adaboost_fraud(
+    feature_values: dict[str, list[str]] | None = None,
+    dt_result: dict | None = None,
+    rf_result: dict | None = None,
+    raw_results: list[tuple] | None = None,
+    n_high: int | None = None,
+    n_low: int | None = None,
+    n_estimators: int = 10,
+    learning_rate: float = 1.0,
+    k_min: int = 0,
+    client=None,
+    org: str | None = None,
+    dataset: str | None = None,
+    schema: str | None = None,
+    max_workers: int = 10,
+) -> dict[str, Any]:
+    """Train fraud AdaBoost stumps from encrypted aggregate counts.
+
+    ``rf_result`` and ``dt_result`` are optional cache sources. If neither is
+    supplied, the helper fetches the required BI counts itself so the notebook
+    cell can run independently.
+    """
+    cache_source = rf_result or dt_result
+    if not feature_values:
+        if cache_source and cache_source.get("feature_values"):
+            feature_values = cache_source["feature_values"]
+        else:
+            raise ValueError(
+                "run_encrypted_adaboost_fraud requires feature_values, rf_result, or dt_result with feature_values."
+            )
+
+    has_bi_context = client is not None and org and dataset and schema
+    if not has_bi_context:
+        raise ValueError("run_encrypted_adaboost_fraud requires BI client/org/dataset/schema.")
+
+    raw_results_source = "provided" if raw_results is not None else "adaboost_rerun"
+    base_rate_queries = 0
+    marginal_queries = 0
+    initial_cache: dict[str, int] = {}
+
+    for candidate_source, source_name in ((rf_result, "rf_result"), (dt_result, "dt_result")):
+        if not candidate_source:
+            continue
+        if raw_results is None and candidate_source.get("raw_results") is not None:
+            raw_results = candidate_source["raw_results"]
+            raw_results_source = source_name
+        if n_high is None and candidate_source.get("n_high") is not None:
+            n_high = candidate_source["n_high"]
+        if n_low is None and candidate_source.get("n_low") is not None:
+            n_low = candidate_source["n_low"]
+        initial_cache.update(candidate_source.get("query_cache", {}))
+
+    if n_high is None or n_low is None:
+        n_high, n_low = get_bi_base_rates(client, org, dataset, schema)
+        base_rate_queries = 2
+    if raw_results is None:
+        raw_results = _run_fraud_marginal_queries(
+            client,
+            org,
+            dataset,
+            schema,
+            feature_values,
+            max_workers=max_workers,
+        )
+        marginal_queries = len(raw_results)
+        raw_results_source = "adaboost_rerun"
+
+    count_fn, query_count, boost_feature_values, aggregate_cache = _build_fraud_dt_count_provider(
+        client=client,
+        org=org,
+        dataset=dataset,
+        schema=schema,
+        feature_values=feature_values,
+        raw_results=raw_results,
+        aggregate_cache=initial_cache,
+    )
+
+    model = _AdaBoostStumpModel(
+        n_estimators=n_estimators,
+        learning_rate=learning_rate,
+        k_min=k_min,
+    ).fit_from_counts(
+        count_fn=count_fn,
+        feature_values=boost_feature_values,
+        n_pos=n_high,
+        n_neg=n_low,
+    )
+
+    additional_adaboost_queries = query_count()
+    enc_queries = marginal_queries + additional_adaboost_queries
+    return {
+        "_model": model,
+        "stumps": model.stumps_,
+        "feature_values": feature_values,
+        "raw_results": raw_results,
+        "raw_results_source": raw_results_source,
+        "query_cache": aggregate_cache,
+        "counts_from_bi": True,
+        "n_high": n_high,
+        "n_low": n_low,
+        "n_estimators": n_estimators,
+        "learning_rate": learning_rate,
+        "k_min": k_min,
+        "train_time": model.train_time,
+        "enc_queries": enc_queries,
+        "base_rate_queries": base_rate_queries,
+        "marginal_queries": marginal_queries,
+        "additional_adaboost_queries": additional_adaboost_queries,
+        "total_aggregate_calls": enc_queries + base_rate_queries,
+        "reused_cache_entries": len(initial_cache),
+    }
+
+
+def fraud_adaboost_predict(boost_result: dict, row: dict) -> tuple[int, float]:
+    """Predict using the encrypted fraud AdaBoost model."""
+    model = boost_result.get("_model")
+    if not model:
+        return 0, 0.0
+    row_normalized = dict(row)
+    for col in _FRAUD_FEATURES_ORDERED:
+        if col in row_normalized:
+            row_normalized[col] = str(row_normalized[col]).lower()
+    return model.predict(row_normalized)
+
+
+def fraud_adaboost_describe(boost_result: dict, max_stumps: int = 5) -> str:
+    """Return a compact text description of the fraud AdaBoost stumps."""
+    model = boost_result.get("_model")
+    if not model or not model.stumps_:
+        return "Empty AdaBoost model"
+
+    lines = [f"AdaBoost: {len(model.stumps_)} stumps, learning_rate={model.learning_rate}, threshold={model.threshold}"]
+    for idx, stump in enumerate(model.stumps_[:max_stumps], 1):
+        lines.append(
+            f"Stump {idx}: {stump['col_name']}? "
+            f"alpha={stump['alpha']:.4f}, error={stump['error']:.4f}, "
+            f"YES->{stump['left_pred']} (risk={stump['left_risk']:.3f}, n={stump['left_n']:,}), "
+            f"NO->{stump['right_pred']} (risk={stump['right_risk']:.3f}, n={stump['right_n']:,})"
+        )
+    if len(model.stumps_) > max_stumps:
+        lines.append(f"... {len(model.stumps_) - max_stumps} more stumps")
+    return "\n".join(lines)
+
+
+def train_plaintext_adaboost_fraud(
+    df: pd.DataFrame,
+    feature_values: dict[str, list[str]],
+    n_estimators: int = 10,
+    learning_rate: float = 1.0,
+    random_state: int = 42,
+) -> dict[str, Any]:
+    """Train a sklearn AdaBoostClassifier with decision stumps on fraud data."""
+    from sklearn.ensemble import AdaBoostClassifier
+    from sklearn.tree import DecisionTreeClassifier
+
+    start = time.time()
+    df2 = df.copy()
+    df2["is_high_risk"] = (df2["risk_level"].astype(int) >= 50).astype(int)
+
+    features = list(_FRAUD_FEATURE_MAP.keys())
+    X = df2[features].copy()
+    for col in features:
+        X[col] = X[col].astype(str)
+    X_encoded = pd.get_dummies(X, columns=features, drop_first=False)
+    col_names = X_encoded.columns.tolist()
+    y = df2["is_high_risk"]
+
+    stump = DecisionTreeClassifier(max_depth=1, random_state=random_state)
+    try:
+        model = AdaBoostClassifier(
+            estimator=stump,
+            n_estimators=n_estimators,
+            learning_rate=learning_rate,
+            random_state=random_state,
+        )
+    except TypeError:
+        model = AdaBoostClassifier(
+            base_estimator=stump,
+            n_estimators=n_estimators,
+            learning_rate=learning_rate,
+            random_state=random_state,
+        )
+    model.fit(X_encoded, y)
+    return {"model": model, "col_names": col_names, "train_time": time.time() - start}
+
+
+def fraud_plaintext_adaboost_predict_proba(
+    model,
+    col_names: list[str],
+    df_test: pd.DataFrame,
+    feature_values: dict[str, list[str]],
+) -> list[float]:
+    """Predict P(high_risk) using a trained sklearn AdaBoostClassifier."""
+    return fraud_plaintext_predict_proba(model, col_names, df_test, feature_values)
 
 
 # =============================================================================
@@ -1911,7 +2556,642 @@ def fraud_lr_predict(
     return lr.predict(_fraud_row_features(row), use_sigmoid=use_sigmoid)
 
 
+# =============================================================================
+# ENCRYPTED GAUSSIAN NAIVE BAYES (fraud)
+# =============================================================================
+
+_FRAUD_GNB_FEATURE_MAP = {
+    "month": ("month_values", "month"),
+    "day": ("day_values", "day"),
+    "year": ("year_values", "year"),
+}
+
+_FRAUD_GNB_DEFAULT_FEATURES = ["month", "day", "year"]
+
+
+def _fraud_gnb_features(
+    feature_values: dict[str, list[str]] | None = None,
+    numeric_features: list[str] | None = None,
+) -> list[str]:
+    """Resolve numeric fraud features for Gaussian Naive Bayes."""
+    if numeric_features is not None:
+        unknown = [feature for feature in numeric_features if feature not in _FRAUD_GNB_FEATURE_MAP]
+        if unknown:
+            raise ValueError(f"Unsupported GaussianNB fraud features: {unknown}")
+        return list(numeric_features)
+
+    if feature_values is None:
+        return list(_FRAUD_GNB_DEFAULT_FEATURES)
+
+    available = [
+        feature for feature in _FRAUD_GNB_DEFAULT_FEATURES if feature_values.get(_FRAUD_GNB_FEATURE_MAP[feature][0])
+    ]
+    return available or list(_FRAUD_GNB_DEFAULT_FEATURES)
+
+
+def _fraud_gnb_row_features(row: dict, numeric_features: list[str]) -> dict[str, float]:
+    """Extract numeric fraud row features for Gaussian Naive Bayes."""
+    return {feature: float(row.get(feature, 0)) for feature in numeric_features}
+
+
+def _fraud_gnb_count_queries(
+    feature_values: dict[str, list[str]],
+    numeric_features: list[str] | None = None,
+) -> list[tuple[str, int, str, str]]:
+    """Build class-split value-count queries for GaussianNB numeric summaries."""
+    queries = []
+    for feature in _fraud_gnb_features(feature_values, numeric_features):
+        values_key, field_name = _FRAUD_GNB_FEATURE_MAP[feature]
+        for value in feature_values.get(values_key, []):
+            value_str = str(value)
+            queries.append((feature, 1, value_str, f"risk_level:count(50~100),{field_name}:{value_str}"))
+            queries.append((feature, 0, value_str, f"risk_level:count(0~49),{field_name}:{value_str}"))
+    return queries
+
+
+def _fraud_gnb_sufficient_stats(raw_results: list[tuple]) -> list[tuple[str, int, int, float, float]]:
+    """Convert class-split integer value counts into Gaussian sufficient stats."""
+    accum: dict[tuple[str, int], dict[str, float]] = {}
+    for feature, class_label, raw_value, count in raw_results:
+        value = float(raw_value)
+        n = int(count)
+        key = (str(feature), int(class_label))
+        stats = accum.setdefault(key, {"count": 0.0, "sum": 0.0, "sum_sq": 0.0})
+        stats["count"] += n
+        stats["sum"] += value * n
+        stats["sum_sq"] += value * value * n
+
+    return [
+        (feature, class_label, int(stats["count"]), stats["sum"], stats["sum_sq"])
+        for (feature, class_label), stats in sorted(accum.items())
+    ]
+
+
+def run_encrypted_gnb_fraud(
+    client,
+    org: str,
+    dataset: str,
+    schema: str,
+    feature_values: dict[str, list[str]],
+    numeric_features: list[str] | None = None,
+    n_high: int | None = None,
+    n_low: int | None = None,
+    var_smoothing: float = 1e-9,
+    threshold: float = 0.5,
+    max_workers: int = 30,
+) -> dict[str, Any]:
+    """Train GaussianNaiveBayesModel from encrypted value-count queries."""
+    start = time.time()
+    base_rate_queries = 0
+    if n_high is None or n_low is None or int(n_high) + int(n_low) == 0:
+        n_high, n_low = get_bi_base_rates(client, org, dataset, schema)
+        base_rate_queries = 2
+
+    features = _fraud_gnb_features(feature_values, numeric_features)
+    queries = _fraud_gnb_count_queries(feature_values, features)
+    raw_results: list[tuple] = []
+
+    def run_query(q):
+        feature, class_label, value, query = q
+        count = get_encrypted_count(client, org, dataset, schema, query)
+        return (feature, class_label, value, count)
+
+    n_batches = 3 if len(queries) >= 3 else 1
+    base = len(queries) // n_batches
+    remainder = len(queries) % n_batches
+    batch_plan = [base + (1 if i < remainder else 0) for i in range(n_batches)]
+
+    offset = 0
+    for planned_size in batch_plan:
+        batch = queries[offset : offset + planned_size]
+        if not batch:
+            break
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            raw_results.extend(executor.map(run_query, batch))
+        offset += planned_size
+
+    sufficient_stats = _fraud_gnb_sufficient_stats(raw_results)
+    model = _GaussianNaiveBayesModel(
+        var_smoothing=var_smoothing,
+        threshold=threshold,
+    ).fit_from_sums(
+        sufficient_stats,
+        n_pos=int(n_high),
+        n_neg=int(n_low),
+    )
+
+    return {
+        "_model": model,
+        "raw_results": raw_results,
+        "sufficient_stats": sufficient_stats,
+        "features": features,
+        "n_high": int(n_high),
+        "n_low": int(n_low),
+        "n_total": int(n_high) + int(n_low),
+        "enc_queries": len(raw_results) + base_rate_queries,
+        "stat_queries": len(raw_results),
+        "base_rate_queries": base_rate_queries,
+        "train_time": time.time() - start,
+    }
+
+
+def train_plaintext_gnb_fraud(
+    df: pd.DataFrame,
+    numeric_features: list[str] | None = None,
+    var_smoothing: float = 1e-9,
+) -> dict[str, Any]:
+    """Train sklearn GaussianNB on local plaintext fraud numeric features."""
+    from sklearn.naive_bayes import GaussianNB
+
+    start = time.time()
+    features = _fraud_gnb_features(numeric_features=numeric_features)
+    df2 = df.copy()
+    df2["is_high_risk"] = (df2["risk_level"].astype(int) >= 50).astype(int)
+
+    X = df2[features].apply(pd.to_numeric, errors="coerce")
+    if X.isnull().any().any():
+        bad_cols = X.columns[X.isnull().any()].tolist()
+        raise ValueError(f"GaussianNB fraud features must be numeric and non-null: {bad_cols}")
+    y = df2["is_high_risk"].astype(int)
+
+    model = GaussianNB(var_smoothing=var_smoothing)
+    model.fit(X, y)
+
+    n_high = int(y.sum())
+    n_low = len(df2) - n_high
+    return {
+        "model": model,
+        "features": features,
+        "n_high": n_high,
+        "n_low": n_low,
+        "n_total": n_high + n_low,
+        "train_time": time.time() - start,
+    }
+
+
+def fraud_gnb_predict(gnb_result: dict, row: dict) -> tuple[int, float]:
+    """Predict with a fraud GaussianNaiveBayesModel. Returns (pred, risk)."""
+    model = gnb_result.get("_model")
+    features = gnb_result.get("features", _FRAUD_GNB_DEFAULT_FEATURES)
+    if model:
+        return model.predict(_fraud_gnb_row_features(row, features))
+    return 0, 0.0
+
+
+def fraud_plaintext_gnb_predict_proba(
+    model,
+    feature_columns: list[str],
+    df_test: pd.DataFrame,
+) -> list[float]:
+    """Predict sklearn GaussianNB P(high_risk) on fraud data."""
+    X = df_test[feature_columns].apply(pd.to_numeric, errors="coerce")
+    proba = model.predict_proba(X)
+    pos_idx = list(model.classes_).index(1) if 1 in model.classes_ else 0
+    return [float(p[pos_idx]) for p in proba]
+
+
+# =============================================================================
+# ENCRYPTED BAYESIAN NETWORK (fraud)
+# =============================================================================
+
+_FRAUD_BN_PARENT_MAP = {
+    "fraud_type": [],
+    "account_jurisdiction": ["fraud_type"],
+    "is_active": ["fraud_type"],
+    "month": ["year"],
+    "reporting_bank_id": ["account_jurisdiction"],
+    "year": [],
+}
+
+
+def _fraud_bn_feature_values(feature_values: dict[str, list[str]]) -> dict[str, list[str]]:
+    """Map notebook feature-value config to BayesianNetwork feature keys."""
+    return {
+        feature: [str(value).lower() for value in feature_values.get(values_key, [])]
+        for feature, (values_key, _field_name) in _FRAUD_FEATURE_MAP.items()
+    }
+
+
+def _fraud_bn_query_values(feature_values: dict[str, list[str]]) -> dict[str, list[str]]:
+    """Feature values in the original BI query casing."""
+    return {
+        feature: [str(value) for value in feature_values.get(values_key, [])]
+        for feature, (values_key, _field_name) in _FRAUD_FEATURE_MAP.items()
+    }
+
+
+def _fraud_query_filter(feature: str, value: str) -> str:
+    """Build a Blind Insight equality filter for one fraud feature value."""
+    field_name = _FRAUD_FEATURE_MAP[feature][1]
+    # ``discover_feature_values`` preserves source case (see 96a09d7); only
+    # ``is_active`` needs canonicalization to match the stored booleans.
+    if feature == "is_active":
+        value = str(value).lower()
+    return f"{field_name}:{value}"
+
+
+def _fraud_bn_cpt_count_queries(
+    feature_values: dict[str, list[str]],
+    parent_map: dict[str, list[str]] | None = None,
+) -> list[tuple[str, int, tuple[tuple[str, str], ...], str, str]]:
+    """Build encrypted count queries for fraud Bayesian-network CPT cells."""
+    resolved_parent_map = parent_map or _FRAUD_BN_PARENT_MAP
+    values_by_feature = _fraud_bn_query_values(feature_values)
+    queries: list[tuple[str, int, tuple[tuple[str, str], ...], str, str]] = []
+
+    for feature in _FRAUD_FEATURES_ORDERED:
+        parents = resolved_parent_map.get(feature, [])
+        parent_value_lists = [values_by_feature.get(parent, []) for parent in parents]
+        parent_combos = list(product(*parent_value_lists)) if parent_value_lists else [tuple()]
+
+        for class_label, risk_filter in ((1, "risk_level:count(50~100)"), (0, "risk_level:count(0~49)")):
+            for parent_combo in parent_combos:
+                parent_state = tuple((parent, str(value).lower()) for parent, value in zip(parents, parent_combo))
+                parent_filters = [
+                    _fraud_query_filter(parent, str(value)) for parent, value in zip(parents, parent_combo)
+                ]
+                for value in values_by_feature.get(feature, []):
+                    filters = [risk_filter, *parent_filters, _fraud_query_filter(feature, value)]
+                    queries.append((feature, class_label, parent_state, str(value).lower(), ",".join(filters)))
+    return queries
+
+
+def run_encrypted_bn_fraud(
+    client,
+    org: str,
+    dataset: str,
+    schema: str,
+    feature_values: dict[str, list[str]],
+    parent_map: dict[str, list[str]] | None = None,
+    n_high: int | None = None,
+    n_low: int | None = None,
+    alpha: float = 1.0,
+    threshold: float = 0.5,
+    max_workers: int = 30,
+) -> dict[str, Any]:
+    """Train BayesianNetworkClassifierModel from encrypted CPT count queries."""
+    start = time.time()
+    base_rate_queries = 0
+    if n_high is None or n_low is None or int(n_high) + int(n_low) == 0:
+        n_high, n_low = get_bi_base_rates(client, org, dataset, schema)
+        base_rate_queries = 2
+
+    resolved_parent_map = parent_map or _FRAUD_BN_PARENT_MAP
+    queries = _fraud_bn_cpt_count_queries(feature_values, resolved_parent_map)
+    raw_results: list[tuple[str, int, tuple[tuple[str, str], ...], str, int]] = []
+
+    def run_query(query_tuple):
+        feature, class_label, parent_state, value, query = query_tuple
+        count = get_encrypted_count(client, org, dataset, schema, query)
+        return (feature, class_label, parent_state, value, count)
+
+    n_batches = 3 if len(queries) >= 3 else 1
+    base = len(queries) // n_batches
+    remainder = len(queries) % n_batches
+    batch_plan = [base + (1 if i < remainder else 0) for i in range(n_batches)]
+
+    offset = 0
+    for planned_size in batch_plan:
+        batch = queries[offset : offset + planned_size]
+        if not batch:
+            break
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            raw_results.extend(executor.map(run_query, batch))
+        offset += planned_size
+
+    model = _BayesianNetworkClassifierModel(
+        parent_map=resolved_parent_map,
+        alpha=alpha,
+        threshold=threshold,
+    ).fit(
+        raw_results,
+        n_pos=int(n_high),
+        n_neg=int(n_low),
+        feature_values=_fraud_bn_feature_values(feature_values),
+    )
+
+    return {
+        "_model": model,
+        "raw_results": raw_results,
+        "parent_map": resolved_parent_map,
+        "feature_values": feature_values,
+        "n_high": int(n_high),
+        "n_low": int(n_low),
+        "n_total": int(n_high) + int(n_low),
+        "enc_queries": len(raw_results) + base_rate_queries,
+        "cpt_queries": len(raw_results),
+        "base_rate_queries": base_rate_queries,
+        "train_time": time.time() - start,
+    }
+
+
+def train_plaintext_bn_fraud(
+    df: pd.DataFrame,
+    feature_values: dict[str, list[str]],
+    parent_map: dict[str, list[str]] | None = None,
+    alpha: float = 1.0,
+    threshold: float = 0.5,
+) -> dict[str, Any]:
+    """Train BayesianNetworkClassifierModel from local plaintext CPT counts."""
+    start = time.time()
+    resolved_parent_map = parent_map or _FRAUD_BN_PARENT_MAP
+    df2 = df.copy()
+    df2["is_high_risk"] = (df2["risk_level"].astype(int) >= 50).astype(int)
+
+    model_feature_values = _fraud_bn_feature_values(feature_values)
+    cpt_counts = _build_bayesian_cpt_counts_local(
+        df2,
+        target_col="is_high_risk",
+        feature_values=model_feature_values,
+        parent_map=resolved_parent_map,
+    )
+    n_high = int(df2["is_high_risk"].sum())
+    n_low = len(df2) - n_high
+    model = _BayesianNetworkClassifierModel(
+        parent_map=resolved_parent_map,
+        alpha=alpha,
+        threshold=threshold,
+    ).fit(
+        cpt_counts,
+        n_pos=n_high,
+        n_neg=n_low,
+        feature_values=model_feature_values,
+    )
+
+    return {
+        "_model": model,
+        "raw_results": cpt_counts,
+        "parent_map": resolved_parent_map,
+        "n_high": n_high,
+        "n_low": n_low,
+        "n_total": n_high + n_low,
+        "train_time": time.time() - start,
+    }
+
+
+def fraud_bn_predict(bn_result: dict, row: dict) -> tuple[int, float]:
+    """Predict with a fraud BayesianNetworkClassifierModel. Returns (pred, risk)."""
+    model = bn_result.get("_model")
+    if model:
+        return model.predict(_fraud_row_features(row))
+    return 0, 0.0
+
+
+def fraud_plaintext_bn_predict_proba(
+    bn_result: dict,
+    df_test: pd.DataFrame,
+) -> list[float]:
+    """Predict plaintext Bayesian Network P(high_risk) on fraud data."""
+    model = bn_result.get("_model")
+    if not model:
+        return []
+    return [model.predict(_fraud_row_features(row.to_dict()))[1] for _, row in df_test.iterrows()]
+
+
+# =============================================================================
+# ENCRYPTED HISTOGRAM CLASSIFIER (fraud)
+# =============================================================================
+
+
+def _fraud_histogram_feature_values(feature_values: dict[str, list[str]]) -> dict[str, list[str]]:
+    """Map fraud notebook feature-value config to HistogramClassifierModel keys."""
+    return {
+        "fraud": feature_values.get("fraud_types", []),
+        "jur": feature_values.get("jurisdictions", []),
+        "active": feature_values.get("active_values", []),
+        "month": feature_values.get("month_values", []),
+        "bank": feature_values.get("bank_ids", []),
+        "year": feature_values.get("year_values", []),
+    }
+
+
+def _fraud_histogram_row_features(row: dict) -> dict[str, str]:
+    """Extract fraud row features using the aggregate-count keys."""
+    return {
+        "fraud": str(row.get("fraud_type", "")).lower(),
+        "jur": str(row.get("account_jurisdiction", "")).lower(),
+        "active": str(row.get("is_active", "")).lower(),
+        "month": str(row.get("month", "")),
+        "bank": str(row.get("reporting_bank_id", "")),
+        "year": str(row.get("year", "")),
+    }
+
+
+def run_encrypted_histogram_fraud(
+    client,
+    org: str,
+    dataset: str,
+    schema: str,
+    feature_values: dict[str, list[str]],
+    n_high: int | None = None,
+    n_low: int | None = None,
+    alpha: float = 1.0,
+    threshold: float | None = None,
+    use_feature_weights: bool = True,
+    max_workers: int = 30,
+) -> dict[str, Any]:
+    """Train HistogramClassifierModel from encrypted aggregate queries.
+
+    Fetches class base rates when not provided, runs the fraud marginal count
+    queries, then fits the histogram model directly from those counts.
+    """
+    start = time.time()
+    base_rate_queries = 0
+    if n_high is None or n_low is None or int(n_high) + int(n_low) == 0:
+        n_high, n_low = get_bi_base_rates(client, org, dataset, schema)
+        base_rate_queries = 2
+
+    queries = _bi_queries(feature_values)
+    raw_results: list[tuple] = []
+
+    def run_query(q):
+        f_type, r_class, val, q_str = q
+        count = get_encrypted_count(client, org, dataset, schema, q_str)
+        return (f_type, r_class, val, count)
+
+    n_batches = 3 if len(queries) >= 3 else 1
+    base = len(queries) // n_batches
+    remainder = len(queries) % n_batches
+    batch_plan = [base + (1 if i < remainder else 0) for i in range(n_batches)]
+
+    offset = 0
+    for planned_size in batch_plan:
+        batch = queries[offset : offset + planned_size]
+        if not batch:
+            break
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            raw_results.extend(executor.map(run_query, batch))
+        offset += planned_size
+
+    model = _HistogramClassifierModel(
+        alpha=alpha,
+        threshold=threshold,
+        use_feature_weights=use_feature_weights,
+    ).fit(
+        raw_results,
+        n_pos=int(n_high),
+        n_neg=int(n_low),
+        feature_values=_fraud_histogram_feature_values(feature_values),
+    )
+
+    return {
+        "_model": model,
+        "raw_results": raw_results,
+        "n_high": int(n_high),
+        "n_low": int(n_low),
+        "n_total": int(n_high) + int(n_low),
+        "enc_queries": len(raw_results) + base_rate_queries,
+        "marginal_queries": len(raw_results),
+        "base_rate_queries": base_rate_queries,
+        "train_time": time.time() - start,
+    }
+
+
+def train_plaintext_histogram_fraud(
+    df: pd.DataFrame,
+    feature_values: dict[str, list[str]],
+    alpha: float = 1.0,
+    threshold: float | None = None,
+    use_feature_weights: bool = True,
+) -> dict[str, Any]:
+    """Train HistogramClassifierModel from local plaintext marginal counts."""
+    start = time.time()
+    raw_results = build_raw_results_local(df, feature_values)
+    n_high = int((df["risk_level"].astype(int) >= 50).sum())
+    n_low = len(df) - n_high
+    model = _HistogramClassifierModel(
+        alpha=alpha,
+        threshold=threshold,
+        use_feature_weights=use_feature_weights,
+    ).fit(
+        raw_results,
+        n_pos=n_high,
+        n_neg=n_low,
+        feature_values=_fraud_histogram_feature_values(feature_values),
+    )
+    return {
+        "_model": model,
+        "raw_results": raw_results,
+        "n_high": n_high,
+        "n_low": n_low,
+        "n_total": n_high + n_low,
+        "train_time": time.time() - start,
+    }
+
+
+def fraud_histogram_predict(hist_result: dict, row: dict) -> tuple[int, float]:
+    """Predict with a fraud HistogramClassifierModel. Returns (pred, risk)."""
+    model = hist_result.get("_model")
+    if model:
+        return model.predict(_fraud_histogram_row_features(row))
+    return 0, 0.0
+
+
 # platt_scale and apply_platt are imported from blind_ml at module top
+
+
+# =============================================================================
+# FRAUD MODEL EVALUATION METRICS
+# =============================================================================
+
+# Typical field fraud positive rate — used for prior-shift evaluation in the demo.
+FRAUD_PRODUCTION_PRIOR = 0.015
+
+
+def recalibrate_fraud_risk(cohort_risk: float, cohort_prev: float, pop_prev: float) -> float:
+    """Shift a cohort-calibrated risk score to a different population prior (Bayes' rule)."""
+    if cohort_risk <= 0 or cohort_prev <= 0 or pop_prev <= 0:
+        return 0.0
+    if cohort_risk >= 1:
+        return 1.0
+    odds = (cohort_risk / (1 - cohort_risk)) * (pop_prev / cohort_prev) * ((1 - cohort_prev) / (1 - pop_prev))
+    return odds / (1 + odds)
+
+
+def compute_fraud_metrics(
+    y_true,
+    scores,
+    threshold: float = 0.5,
+    cohort_prior: float | None = None,
+    production_prior: float = FRAUD_PRODUCTION_PRIOR,
+) -> dict[str, Any]:
+    """Evaluate fraud-model scores on a held-out test set.
+
+    Returns confusion-matrix metrics at ``threshold``, plus ROC-AUC / PR-AUC on the
+    demo cohort prior and F1@best after recalibrating scores to ``production_prior``.
+    """
+    from sklearn.metrics import average_precision_score, precision_recall_curve, roc_auc_score
+
+    y_true_arr = np.asarray(y_true, dtype=int)
+    scores_arr = np.asarray(scores, dtype=float)
+    n = len(y_true_arr)
+    if cohort_prior is None:
+        cohort_prior = float(y_true_arr.mean()) if n else 0.5
+
+    preds = (scores_arr >= threshold).astype(int)
+    tp = int(((preds == 1) & (y_true_arr == 1)).sum())
+    fp = int(((preds == 1) & (y_true_arr == 0)).sum())
+    fn = int(((preds == 0) & (y_true_arr == 1)).sum())
+    tn = int(((preds == 0) & (y_true_arr == 0)).sum())
+    sens = tp / max(1, tp + fn)
+    spec = tn / max(1, tn + fp)
+    ppv = tp / max(1, tp + fp)
+    f1 = 2 * tp / max(1, 2 * tp + fp + fn)
+    flagged = (tp + fp) / max(1, n)
+    acc = (tp + tn) / max(1, n)
+
+    if len(np.unique(y_true_arr)) < 2:
+        roc_auc = float("nan")
+        pr_auc = float("nan")
+        f1_best = float("nan")
+        f1_prod_best = float("nan")
+    else:
+        roc_auc = float(roc_auc_score(y_true_arr, scores_arr))
+        pr_auc = float(average_precision_score(y_true_arr, scores_arr))
+        precisions, recalls, _ = precision_recall_curve(y_true_arr, scores_arr)
+        f1_curve = 2 * precisions * recalls / np.maximum(precisions + recalls, 1e-12)
+        f1_best = float(np.nanmax(f1_curve))
+
+        prod_scores = np.array([recalibrate_fraud_risk(float(s), cohort_prior, production_prior) for s in scores_arr])
+        prec_p, rec_p, _ = precision_recall_curve(y_true_arr, prod_scores)
+        f1_prod_curve = 2 * prec_p * rec_p / np.maximum(prec_p + rec_p, 1e-12)
+        f1_prod_best = float(np.nanmax(f1_prod_curve))
+
+    return {
+        "tp": tp,
+        "fp": fp,
+        "fn": fn,
+        "tn": tn,
+        "sens": sens,
+        "spec": spec,
+        "ppv": ppv,
+        "f1": f1,
+        "f1_best": f1_best,
+        "flagged": flagged,
+        "acc": acc,
+        "roc_auc": roc_auc,
+        "pr_auc": pr_auc,
+        "f1_prod_best": f1_prod_best,
+        "cohort_prior": cohort_prior,
+        "production_prior": production_prior,
+        "threshold": threshold,
+    }
+
+
+def _format_metric_delta(enc: float, plain: float, higher_better: bool = True, scale: float = 1.0) -> str:
+    d = (enc - plain) * scale
+    cls = "status-good" if (d >= 0) == higher_better else "status-bad"
+    if scale == 100:
+        return f"<td class='{cls}'>{d:+.1f}pp</td>"
+    return f"<td class='{cls}'>{d:+.3f}</td>"
+
+
+def _format_metric_value(value: float, pct: bool = False) -> str:
+    if value != value:  # NaN
+        return "—"
+    if pct:
+        return f"{value * 100:.1f}%"
+    return f"{value:.3f}"
 
 
 # =============================================================================
@@ -1921,51 +3201,39 @@ def fraud_lr_predict(
 
 def fraud_model_summary_table(
     model_name: str,
-    enc_f1: float,
-    plain_f1: float,
-    enc_sens: float,
-    plain_sens: float,
-    enc_spec: float,
-    plain_spec: float,
-    enc_ppv: float,
-    plain_ppv: float,
-    enc_flagged: float,
-    plain_flagged: float,
+    enc_metrics: dict[str, Any],
+    plain_metrics: dict[str, Any],
     enc_train_time: float,
     plain_train_time: float,
     enc_queries: int = 0,
+    plain_label: str = "sklearn",
     **kwargs,
 ) -> str:
-    """Build a comparison table for a single fraud model (encrypted vs sklearn)."""
+    """Build a comparison table for a single fraud model (encrypted vs benchmark)."""
+    prod_pct = enc_metrics.get("production_prior", FRAUD_PRODUCTION_PRIOR) * 100
 
-    def _delta(enc, plain, higher_better=True):
-        d = enc - plain
-        pp = d * 100
-        cls = "status-good" if (d >= 0) == higher_better else "status-bad"
-        return f"<td class='{cls}'>{pp:+.1f}pp</td>"
+    def _row(label: str, enc_key: str, plain_key: str, pct: bool = False) -> str:
+        enc_val = enc_metrics.get(enc_key, float("nan"))
+        plain_val = plain_metrics.get(plain_key, float("nan"))
+        return (
+            f"<tr class='data-row'><td class='label-cell'>{label}</td>"
+            f"<td class='number-cell'>{_format_metric_value(plain_val, pct=pct)}</td>"
+            f"<td class='number-cell'>{_format_metric_value(enc_val, pct=pct)}</td>"
+            f"{_format_metric_delta(enc_val, plain_val)}</tr>"
+        )
 
     return f"""<table class="bi-metrics-table">
-<tr class="header-row"><th></th><th>sklearn</th><th>Blind Insight</th><th>Delta</th></tr>
-<tr class='data-row'><td class='label-cell'>F1 Score</td>
-    <td class='number-cell'>{plain_f1:.3f}</td>
-    <td class='number-cell'>{enc_f1:.3f}</td>
-    {_delta(enc_f1, plain_f1)}</tr>
-<tr class='data-row'><td class='label-cell'>Sensitivity</td>
-    <td class='number-cell'>{plain_sens * 100:.1f}%</td>
-    <td class='number-cell'>{enc_sens * 100:.1f}%</td>
-    {_delta(enc_sens, plain_sens)}</tr>
-<tr class='data-row'><td class='label-cell'>Specificity</td>
-    <td class='number-cell'>{plain_spec * 100:.1f}%</td>
-    <td class='number-cell'>{enc_spec * 100:.1f}%</td>
-    {_delta(enc_spec, plain_spec)}</tr>
-<tr class='data-row'><td class='label-cell'>PPV (precision)</td>
-    <td class='number-cell'>{plain_ppv * 100:.1f}%</td>
-    <td class='number-cell'>{enc_ppv * 100:.1f}%</td>
-    {_delta(enc_ppv, plain_ppv)}</tr>
-<tr class='data-row'><td class='label-cell'>Flagged High-Risk</td>
-    <td class='number-cell'>{plain_flagged * 100:.1f}%</td>
-    <td class='number-cell'>{enc_flagged * 100:.1f}%</td>
-    <td class='number-cell'>{(enc_flagged - plain_flagged) * 100:+.1f}pp</td></tr>
+<caption style="caption-side:top;text-align:left;font-weight:600;padding-bottom:4px;">{model_name}</caption>
+<tr class="header-row"><th></th><th>{plain_label}</th><th>Blind Insight</th><th>Delta</th></tr>
+{_row("F1 @0.5 (demo prior)", "f1", "f1")}
+{_row("F1@best (demo prior)", "f1_best", "f1_best")}
+{_row("ROC-AUC", "roc_auc", "roc_auc")}
+{_row("PR-AUC", "pr_auc", "pr_auc")}
+{_row(f"F1@best @ {prod_pct:.1f}% prod prior", "f1_prod_best", "f1_prod_best")}
+{_row("Sensitivity @0.5", "sens", "sens", pct=True)}
+{_row("Specificity @0.5", "spec", "spec", pct=True)}
+{_row("PPV (precision) @0.5", "ppv", "ppv", pct=True)}
+{_row("Flagged High-Risk @0.5", "flagged", "flagged", pct=True)}
 <tr class='data-row'><td class='label-cell'>Train Time</td>
     <td class='number-cell'>{plain_train_time * 1000:.0f}ms</td>
     <td class='number-cell'>{enc_train_time:.1f}s</td>
@@ -1978,37 +3246,38 @@ def fraud_model_summary_table(
 
 
 def fraud_three_model_table(models: list[dict[str, Any]]) -> str:
-    """Build a three-model comparison table for fraud (NB, DT, LR vs sklearn)."""
-    header = "<tr class='header-row'><th></th>"
+    """Build a multi-model comparison table (encrypted metrics on the demo test set)."""
+    header = "<tr class='header-row'><th>Metric</th>"
     for m in models:
         header += f"<th>{m['name']}</th>"
     header += "</tr>"
 
-    def _row(label, key, fmt=".3f"):
+    def _row(label: str, key: str, fmt: str = ".3f") -> str:
         cells = f"<td class='label-cell'>{label}</td>"
         for m in models:
-            v = m.get(key, 0)
-            if isinstance(v, float):
-                cells += f"<td class='number-cell'>{v:{fmt}}</td>"
-            else:
-                cells += f"<td class='number-cell'>{v}</td>"
+            metrics = m.get("enc_metrics", m)
+            v = metrics.get(key, float("nan"))
+            cells += (
+                f"<td class='number-cell'>{_format_metric_value(v)}</td>"
+                if fmt == ".3f"
+                else f"<td class='number-cell'>{v:{fmt}}</td>"
+            )
         return f"<tr class='data-row'>{cells}</tr>"
 
-    def _delta_row(label, enc_key, plain_key, fmt=".1f"):
-        cells = f"<td class='label-cell'>{label}</td>"
-        for m in models:
-            d = (m.get(enc_key, 0) - m.get(plain_key, 0)) * 100
-            cls = "status-good" if abs(d) < 1 else ("status-bad" if d < -1 else "number-cell")
-            cells += f"<td class='{cls}'>{d:+{fmt}}pp</td>"
-        return f"<tr class='data-row'>{cells}</tr>"
+    prod_pct = FRAUD_PRODUCTION_PRIOR * 100
+    if models:
+        first = models[0].get("enc_metrics", models[0])
+        if first.get("production_prior") is not None:
+            prod_pct = first["production_prior"] * 100
 
     rows = "\n".join(
         [
-            _row("Encrypted F1", "enc_f1"),
-            _row("sklearn F1", "plain_f1"),
-            _delta_row("F1 Gap", "enc_f1", "plain_f1"),
-            _row("Encrypted Accuracy", "enc_acc", ".1%"),
-            _row("sklearn Accuracy", "plain_acc", ".1%"),
+            _row("F1 @0.5", "f1"),
+            _row("F1@best", "f1_best"),
+            _row("ROC-AUC", "roc_auc"),
+            _row("PR-AUC", "pr_auc"),
+            _row(f"F1@best @ {prod_pct:.1f}% prod", "f1_prod_best"),
+            _row("Accuracy @0.5", "acc", ".1%"),
         ]
     )
 

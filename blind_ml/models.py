@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import math
 import time
+from collections.abc import Callable
+from itertools import product
 from typing import Any
 
 import numpy as np
@@ -144,6 +146,477 @@ class NaiveBayesModel:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# GAUSSIAN NAIVE BAYES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class GaussianNaiveBayesModel:
+    """Gaussian Naive Bayes trained from class-conditional numeric summaries.
+
+    Each feature is modeled as normally distributed within each class using
+    ``count``, ``mean``, and population ``variance``. These summaries can come
+    from local plaintext data or encrypted aggregate queries.
+    """
+
+    def __init__(
+        self,
+        var_smoothing: float = 1e-9,
+        threshold: float = 0.5,
+    ) -> None:
+        self.var_smoothing = var_smoothing
+        self.threshold = threshold
+        self.P_pos: float = 0.5
+        self.P_neg: float = 0.5
+        self.stats: dict[str, dict[int, dict[str, float]]] = {}
+        self.feature_keys: list[str] = []
+        self.epsilon_: float = 1e-12
+        self.train_time: float = 0.0
+
+    def fit(
+        self,
+        gaussian_stats: list[tuple[str, int, int, float, float]],
+        n_pos: int | None = None,
+        n_neg: int | None = None,
+        global_variance: float | None = None,
+    ) -> GaussianNaiveBayesModel:
+        """Fit from class-conditional Gaussian summaries.
+
+        Parameters
+        ----------
+        gaussian_stats : list of (feature_key, class_label, count, mean, variance)
+            ``variance`` must be the population variance for that feature within
+            the class, matching sklearn's GaussianNB convention.
+        n_pos, n_neg : optional class totals. If omitted, inferred from summary
+            counts by taking the largest count seen for each class.
+        global_variance : optional maximum overall feature variance for sklearn-
+            style smoothing. If omitted, max class-conditional variance is used.
+        """
+        start = time.time()
+        if not gaussian_stats:
+            raise ValueError("gaussian_stats must contain at least one feature summary")
+
+        grouped: dict[str, dict[int, dict[str, float]]] = {}
+        inferred_counts = {1: 0, 0: 0}
+        max_class_variance = 0.0
+
+        for feature_key, class_label, count, mean, variance in gaussian_stats:
+            cls = int(class_label)
+            if cls not in (0, 1):
+                raise ValueError("GaussianNaiveBayesModel supports binary class labels 0 and 1")
+            n = int(count)
+            var = max(float(variance), 0.0)
+            grouped.setdefault(feature_key, {})[cls] = {
+                "count": float(n),
+                "mean": float(mean),
+                "var": var,
+            }
+            inferred_counts[cls] = max(inferred_counts[cls], n)
+            max_class_variance = max(max_class_variance, var)
+
+        if n_pos is None:
+            n_pos = inferred_counts[1]
+        if n_neg is None:
+            n_neg = inferred_counts[0]
+
+        n_total = int(n_pos) + int(n_neg)
+        self.P_pos = int(n_pos) / n_total if n_total > 0 else 0.5
+        self.P_neg = int(n_neg) / n_total if n_total > 0 else 0.5
+
+        smoothing_source = max(float(global_variance or 0.0), max_class_variance)
+        self.epsilon_ = max(self.var_smoothing * smoothing_source, 1e-12)
+        self.feature_keys = sorted(grouped.keys())
+        self.stats = {feature_key: {} for feature_key in self.feature_keys}
+
+        for feature_key in self.feature_keys:
+            for cls in (0, 1):
+                if cls not in grouped[feature_key]:
+                    continue
+                class_stats = grouped[feature_key][cls]
+                self.stats[feature_key][cls] = {
+                    "count": class_stats["count"],
+                    "mean": class_stats["mean"],
+                    "var": max(class_stats["var"] + self.epsilon_, 1e-12),
+                }
+
+        self.train_time = time.time() - start
+        return self
+
+    def fit_dataframe(
+        self,
+        df: pd.DataFrame,
+        feature_columns: list[str],
+        target_col: str,
+    ) -> GaussianNaiveBayesModel:
+        """Fit from a plaintext DataFrame of numeric features."""
+        if not feature_columns:
+            raise ValueError("feature_columns must contain at least one feature")
+
+        X = df[feature_columns].apply(pd.to_numeric, errors="coerce")
+        if X.isnull().any().any():
+            bad_cols = X.columns[X.isnull().any()].tolist()
+            raise ValueError(f"GaussianNaiveBayesModel requires numeric, non-null features: {bad_cols}")
+
+        y = df[target_col].astype(int)
+        if not set(y.unique()).issubset({0, 1}):
+            raise ValueError("GaussianNaiveBayesModel requires binary target labels 0 and 1")
+
+        n_pos = int((y == 1).sum())
+        n_neg = int((y == 0).sum())
+        global_variance = float(np.var(X.values.astype(np.float64), axis=0).max())
+
+        summaries: list[tuple[str, int, int, float, float]] = []
+        for feature_key in feature_columns:
+            values = X[feature_key].values.astype(np.float64)
+            for cls in (1, 0):
+                class_values = values[(y == cls).values]
+                count = len(class_values)
+                mean = float(class_values.mean()) if count else 0.0
+                variance = float(class_values.var()) if count else 0.0
+                summaries.append((feature_key, cls, count, mean, variance))
+
+        return self.fit(summaries, n_pos=n_pos, n_neg=n_neg, global_variance=global_variance)
+
+    def fit_from_sums(
+        self,
+        sufficient_stats: list[tuple[str, int, int, float, float]],
+        n_pos: int | None = None,
+        n_neg: int | None = None,
+    ) -> GaussianNaiveBayesModel:
+        """Fit from (feature_key, class_label, count, sum, sum_of_squares)."""
+        summaries: list[tuple[str, int, int, float, float]] = []
+        feature_totals: dict[str, dict[str, float]] = {}
+
+        for feature_key, class_label, count, value_sum, squared_sum in sufficient_stats:
+            n = int(count)
+            if n > 0:
+                mean = float(value_sum) / n
+                variance = max(float(squared_sum) / n - mean * mean, 0.0)
+            else:
+                mean = 0.0
+                variance = 0.0
+            totals = feature_totals.setdefault(feature_key, {"count": 0.0, "sum": 0.0, "sum_sq": 0.0})
+            totals["count"] += n
+            totals["sum"] += float(value_sum)
+            totals["sum_sq"] += float(squared_sum)
+            summaries.append((feature_key, int(class_label), n, mean, variance))
+
+        global_variance = 0.0
+        for totals in feature_totals.values():
+            n = totals["count"]
+            if n > 0:
+                mean = totals["sum"] / n
+                global_variance = max(global_variance, max(totals["sum_sq"] / n - mean * mean, 0.0))
+
+        return self.fit(summaries, n_pos=n_pos, n_neg=n_neg, global_variance=global_variance)
+
+    def predict(self, row_features: dict[str, Any]) -> tuple[int, float]:
+        """Return (predicted_class, posterior_risk) for one numeric row."""
+        eps = 1e-12
+        log_pos = math.log(self.P_pos + eps)
+        log_neg = math.log(self.P_neg + eps)
+
+        for feature_key in self.feature_keys:
+            raw_value = row_features.get(feature_key)
+            if raw_value is None:
+                continue
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError):
+                continue
+
+            for cls, log_name in ((1, "pos"), (0, "neg")):
+                class_stats = self.stats.get(feature_key, {}).get(cls)
+                if not class_stats:
+                    continue
+                mean = class_stats["mean"]
+                variance = class_stats["var"]
+                log_likelihood = -0.5 * (math.log(2.0 * math.pi * variance) + ((value - mean) ** 2) / variance)
+                if log_name == "pos":
+                    log_pos += log_likelihood
+                else:
+                    log_neg += log_likelihood
+
+        max_log = max(log_pos, log_neg)
+        p_pos = math.exp(log_pos - max_log)
+        p_neg = math.exp(log_neg - max_log)
+        risk = p_pos / (p_pos + p_neg)
+        pred = 1 if risk >= self.threshold else 0
+        return pred, risk
+
+    def predict_class(self, row_features: dict[str, Any]) -> int:
+        return self.predict(row_features)[0]
+
+    def predict_risk(self, row_features: dict[str, Any]) -> float:
+        return self.predict(row_features)[1]
+
+    def predict_batch(self, df: pd.DataFrame) -> list[tuple[int, float]]:
+        return [self.predict(row.to_dict()) for _, row in df.iterrows()]
+
+
+GaussianNaiveBayes = GaussianNaiveBayesModel
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# BAYESIAN NETWORK CLASSIFIER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class BayesianNetworkClassifierModel:
+    """Discrete Bayesian-network classifier trained from conditional counts.
+
+    The target class is implicit and acts as a parent of every feature.  The
+    optional ``parent_map`` adds directed feature-to-feature dependencies, so
+    prediction uses:
+
+    ``P(class | x) ∝ P(class) × Π P(feature | class, feature_parents)``.
+
+    The conditional-probability tables can be built from encrypted aggregate
+    counts because every CPT cell is just a filtered count.
+    """
+
+    def __init__(
+        self,
+        parent_map: dict[str, list[str]] | None = None,
+        alpha: float = 1.0,
+        threshold: float = 0.5,
+        backoff_to_marginal: bool = True,
+    ) -> None:
+        self.parent_map = {feature: list(parents) for feature, parents in (parent_map or {}).items()}
+        self.alpha = alpha
+        self.threshold = threshold
+        self.backoff_to_marginal = backoff_to_marginal
+        self.P_pos: float = 0.5
+        self.P_neg: float = 0.5
+        self.feature_keys: list[str] = []
+        self.feature_values: dict[str, list[str]] = {}
+        self.cpts: dict[str, dict[int, dict[tuple[tuple[str, str], ...], dict[str, float]]]] = {}
+        self.marginals: dict[str, dict[int, dict[str, float]]] = {}
+        self.default_probs: dict[str, dict[int, float]] = {}
+        self.train_time: float = 0.0
+
+    @staticmethod
+    def _norm_value(value: Any) -> str:
+        return str(value).lower()
+
+    def _normalize_parent_state(
+        self,
+        feature_key: str,
+        parent_values: dict[str, Any] | list[tuple[str, Any]] | tuple[tuple[str, Any], ...] | None,
+    ) -> tuple[tuple[str, str], ...]:
+        parent_order = self.parent_map.get(feature_key, [])
+        if not parent_order:
+            return tuple()
+
+        if parent_values is None:
+            provided: dict[str, Any] = {}
+        elif isinstance(parent_values, dict):
+            provided = parent_values
+        else:
+            provided = dict(parent_values)
+
+        return tuple((parent, self._norm_value(provided.get(parent, ""))) for parent in parent_order)
+
+    def _validate_graph(self, feature_keys: list[str]) -> None:
+        feature_set = set(feature_keys)
+        for feature, parents in self.parent_map.items():
+            if feature not in feature_set:
+                raise ValueError(f"parent_map contains unknown feature {feature!r}")
+            unknown = [parent for parent in parents if parent not in feature_set]
+            if unknown:
+                raise ValueError(f"parent_map[{feature!r}] contains unknown parents: {unknown}")
+            if feature in parents:
+                raise ValueError(f"parent_map[{feature!r}] cannot include itself as a parent")
+
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def visit(feature: str) -> None:
+            if feature in visited:
+                return
+            if feature in visiting:
+                raise ValueError("parent_map must be acyclic")
+            visiting.add(feature)
+            for parent in self.parent_map.get(feature, []):
+                visit(parent)
+            visiting.remove(feature)
+            visited.add(feature)
+
+        for feature in feature_keys:
+            visit(feature)
+
+    def fit(
+        self,
+        cpt_counts: list[tuple[str, int, Any, str, int]],
+        n_pos: int,
+        n_neg: int,
+        feature_values: dict[str, list[str]],
+    ) -> BayesianNetworkClassifierModel:
+        """Fit CPTs from conditional count tuples.
+
+        Parameters
+        ----------
+        cpt_counts : list of ``(feature_key, class_label, parent_values, value, count)``
+            ``parent_values`` may be a dict or tuple/list of ``(parent, value)``
+            pairs matching ``parent_map[feature_key]``.
+        n_pos, n_neg : class totals
+        feature_values : ``{feature_key: [possible_values]}``
+        """
+        start = time.time()
+        if not feature_values:
+            raise ValueError("feature_values must contain at least one feature")
+        if self.alpha < 0:
+            raise ValueError("alpha must be >= 0")
+
+        self.feature_keys = list(feature_values.keys())
+        self.feature_values = {
+            feature_key: [self._norm_value(value) for value in values] for feature_key, values in feature_values.items()
+        }
+        for feature_key in self.feature_keys:
+            self.parent_map.setdefault(feature_key, [])
+        self._validate_graph(self.feature_keys)
+
+        n_total = int(n_pos) + int(n_neg)
+        self.P_pos = int(n_pos) / n_total if n_total > 0 else 0.5
+        self.P_neg = int(n_neg) / n_total if n_total > 0 else 0.5
+
+        counts: dict[str, dict[int, dict[tuple[tuple[str, str], ...], dict[str, int]]]] = {}
+        marginal_counts: dict[str, dict[int, dict[str, int]]] = {}
+        for feature_key, class_label, parent_values, raw_value, raw_count in cpt_counts:
+            feature = str(feature_key)
+            if feature not in self.feature_values:
+                continue
+            cls = int(class_label)
+            if cls not in (0, 1):
+                raise ValueError("BayesianNetworkClassifierModel supports binary class labels 0 and 1")
+            value = self._norm_value(raw_value)
+            count = int(raw_count)
+            parent_state = self._normalize_parent_state(feature, parent_values)
+            counts.setdefault(feature, {}).setdefault(cls, {}).setdefault(parent_state, {})[value] = (
+                counts.setdefault(feature, {}).setdefault(cls, {}).setdefault(parent_state, {}).get(value, 0) + count
+            )
+            marginal_counts.setdefault(feature, {}).setdefault(cls, {})[value] = (
+                marginal_counts.setdefault(feature, {}).setdefault(cls, {}).get(value, 0) + count
+            )
+
+        self.cpts = {feature: {1: {}, 0: {}} for feature in self.feature_keys}
+        self.marginals = {feature: {1: {}, 0: {}} for feature in self.feature_keys}
+        self.default_probs = {feature: {1: 0.0, 0: 0.0} for feature in self.feature_keys}
+
+        for feature in self.feature_keys:
+            values = self.feature_values[feature]
+            n_values = max(1, len(values))
+            for cls in (1, 0):
+                class_counts = marginal_counts.get(feature, {}).get(cls, {})
+                class_total = sum(class_counts.values())
+                marginal_denom = class_total + self.alpha * n_values
+                self.default_probs[feature][cls] = (
+                    (self.alpha / marginal_denom) if marginal_denom > 0 else 1.0 / n_values
+                )
+                for value in values:
+                    self.marginals[feature][cls][value] = (
+                        (class_counts.get(value, 0) + self.alpha) / marginal_denom
+                        if marginal_denom > 0
+                        else 1.0 / n_values
+                    )
+
+                for parent_state, state_counts in counts.get(feature, {}).get(cls, {}).items():
+                    parent_total = sum(state_counts.values())
+                    denom = parent_total + self.alpha * n_values
+                    self.cpts[feature][cls][parent_state] = {}
+                    for value in values:
+                        self.cpts[feature][cls][parent_state][value] = (
+                            (state_counts.get(value, 0) + self.alpha) / denom if denom > 0 else 1.0 / n_values
+                        )
+
+        self.train_time = time.time() - start
+        return self
+
+    def fit_dataframe(
+        self,
+        df: pd.DataFrame,
+        feature_columns: list[str],
+        target_col: str,
+        feature_values: dict[str, list[str]] | None = None,
+    ) -> BayesianNetworkClassifierModel:
+        """Fit CPTs from a plaintext categorical DataFrame."""
+        if not feature_columns:
+            raise ValueError("feature_columns must contain at least one feature")
+
+        working = df.copy()
+        for feature in feature_columns:
+            working[feature] = working[feature].astype(str).str.lower()
+        y = working[target_col].astype(int)
+        if not set(y.unique()).issubset({0, 1}):
+            raise ValueError("BayesianNetworkClassifierModel requires binary target labels 0 and 1")
+
+        if feature_values is None:
+            feature_values = {
+                feature: sorted(working[feature].astype(str).str.lower().unique().tolist())
+                for feature in feature_columns
+            }
+        else:
+            feature_values = {
+                feature: [self._norm_value(value) for value in feature_values.get(feature, [])]
+                for feature in feature_columns
+            }
+
+        for feature in feature_columns:
+            self.parent_map.setdefault(feature, [])
+        self._validate_graph(feature_columns)
+
+        cpt_counts = build_bayesian_cpt_counts_local(
+            working,
+            target_col=target_col,
+            feature_values=feature_values,
+            parent_map=self.parent_map,
+        )
+
+        return self.fit(
+            cpt_counts,
+            n_pos=int((y == 1).sum()),
+            n_neg=int((y == 0).sum()),
+            feature_values=feature_values,
+        )
+
+    def predict(self, row_features: dict[str, Any]) -> tuple[int, float]:
+        """Return ``(predicted_class, posterior_risk)`` for one row."""
+        eps = 1e-12
+        log_scores = {
+            1: math.log(self.P_pos + eps),
+            0: math.log(self.P_neg + eps),
+        }
+
+        for feature in self.feature_keys:
+            value = self._norm_value(row_features.get(feature, ""))
+            parent_values = {parent: row_features.get(parent, "") for parent in self.parent_map.get(feature, [])}
+            parent_state = self._normalize_parent_state(feature, parent_values)
+            for cls in (1, 0):
+                probs = self.cpts.get(feature, {}).get(cls, {}).get(parent_state)
+                if probs is None and self.backoff_to_marginal:
+                    probs = self.marginals.get(feature, {}).get(cls, {})
+                prob = (probs or {}).get(value, self.default_probs.get(feature, {}).get(cls, eps))
+                log_scores[cls] += math.log(max(prob, eps))
+
+        max_log = max(log_scores.values())
+        p_pos = math.exp(log_scores[1] - max_log)
+        p_neg = math.exp(log_scores[0] - max_log)
+        risk = p_pos / (p_pos + p_neg)
+        return (1 if risk >= self.threshold else 0), risk
+
+    def predict_class(self, row_features: dict[str, Any]) -> int:
+        return self.predict(row_features)[0]
+
+    def predict_risk(self, row_features: dict[str, Any]) -> float:
+        return self.predict(row_features)[1]
+
+    def predict_batch(self, df: pd.DataFrame) -> list[tuple[int, float]]:
+        return [self.predict(row.to_dict()) for _, row in df.iterrows()]
+
+
+BayesianNetwork = BayesianNetworkClassifierModel
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # DECISION TREE  (binary CART, matches sklearn DecisionTreeClassifier)
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -169,6 +642,10 @@ class DecisionTreeModel:
         self._col_set: set = set()
         self.feature_columns: list[str] = []
         self.train_time: float = 0.0
+
+    @staticmethod
+    def _norm_value(value: Any) -> str:
+        return str(value).lower()
 
     def fit(
         self,
@@ -251,176 +728,131 @@ class DecisionTreeModel:
         self.train_time = time.time() - start
         return self
 
-    def fit_with_bi_root(
+    def fit_from_counts(
         self,
-        raw_results: list[tuple[str, int, str, int]],
-        feat_type_to_column: dict[str, str],
-        df: pd.DataFrame,
-        feature_columns: list[str],
-        target_col: str,
+        count_fn: Callable[[tuple[tuple[str, str, bool], ...], str, str, int], int],
+        feature_values: dict[str, list[str]],
         n_pos: int,
         n_neg: int,
     ) -> DecisionTreeModel:
-        """Build a decision tree whose ROOT split is chosen from BI marginal counts.
-
-        The root one-hot dummy column is selected by computing Gini gain across
-        every (feature, value) pair in ``raw_results`` using only the encrypted
-        aggregate counts. Deeper splits are computed from the local DataFrame
-        mirror — see APPROACH.md, "root split from BI marginals, deeper splits
-        from local cross-tabs."
+        """Build a binary CART tree from aggregate conditional counts.
 
         Parameters
         ----------
-        raw_results : list of ``(feat_type, class_label, value, count)`` tuples
-            as returned by ``run_bi_training`` — the encrypted aggregate counts.
-        feat_type_to_column : maps the ``feat_type`` strings used in raw_results
-            (e.g. ``"fraud"``) to the actual DataFrame column names (e.g.
-            ``"fraud_type"``).
-        df : local plaintext mirror; used only for deeper splits.
-        feature_columns : feature columns to one-hot encode (in df).
-        target_col : binary 0/1 target column.
-        n_pos, n_neg : class totals from BI (``get_bi_base_rates``). The root
-            split's Gini gain is computed against these totals, not the local
-            DataFrame's class counts.
+        count_fn : callable
+            ``count_fn(path, feature_key, value, class_label)`` must return the
+            count of rows matching ``path`` AND ``feature_key == value`` AND the
+            binary class label. ``path`` is a tuple of
+            ``(feature_key, value, branch)`` entries where ``branch=True`` means
+            the previous split took the equality/left branch and
+            ``branch=False`` means it took the not-equal/right branch.
+        feature_values : {feature_key: [values]}
+            Candidate categorical values for one-hot CART splits.
+        n_pos, n_neg : class totals at the root node.
         """
         start = time.time()
-        self.feature_columns = list(feature_columns)
+        if not feature_values:
+            raise ValueError("feature_values must contain at least one feature")
 
-        # One-hot encode the local mirror — same encoding ``fit`` uses so
-        # predict() and column names stay consistent.
-        X = df[feature_columns].copy()
-        for col in feature_columns:
-            X[col] = X[col].astype(str)
-        X_encoded = pd.get_dummies(X, columns=feature_columns, drop_first=False)
-        self.col_names = X_encoded.columns.tolist()
+        self.feature_columns = list(feature_values.keys())
+        normalized_values: dict[str, list[str]] = {}
+        for feature, values in feature_values.items():
+            seen: set[str] = set()
+            normalized_values[feature] = []
+            for raw_value in values:
+                value = self._norm_value(raw_value)
+                if value in seen:
+                    continue
+                seen.add(value)
+                normalized_values[feature].append(value)
+
+        candidates: list[tuple[str, str, int, str]] = []
+        self.col_names = []
+        for feature in self.feature_columns:
+            for value in normalized_values[feature]:
+                col_name = f"{feature}_{value}"
+                col_idx = len(self.col_names)
+                self.col_names.append(col_name)
+                candidates.append((feature, value, col_idx, col_name))
         self._col_set = set(self.col_names)
 
-        y = df[target_col].values.astype(int)
-        X_arr = X_encoded.values.astype(np.float64)
         imp_fn = gini if self.criterion == "gini" else entropy
         _k = self.k_min
         _md = self.max_depth
+        count_cache: dict[tuple[tuple[tuple[str, str, bool], ...], str, str, int], int] = {}
 
-        # ── Step 1: pick the ROOT split from BI marginal counts ────────────
-        # raw_results contains, for each (feat_type, class, value) triple, the
-        # encrypted aggregate count. Build a lookup: counts[col_name][class] = count.
-        # col_name follows pd.get_dummies' convention: f"{column}_{value}".
-        counts: dict[str, dict[int, int]] = {}
-        for feat_type, cls, val, count in raw_results:
-            col = feat_type_to_column.get(feat_type)
-            if col is None:
-                continue
-            col_name = f"{col}_{val}"
-            counts.setdefault(col_name, {0: 0, 1: 0})[int(cls)] = int(count)
+        def _count(
+            path: tuple[tuple[str, str, bool], ...],
+            feature: str,
+            value: str,
+            cls: int,
+        ) -> int:
+            key = (path, feature, value, int(cls))
+            if key not in count_cache:
+                count_cache[key] = int(count_fn(path, feature, value, int(cls)))
+            return count_cache[key]
 
-        base_imp_root = imp_fn(n_pos, n_neg)
-        best_gain_bi = 0.0
-        best_col_name: str | None = None
-        for col_name, by_class in counts.items():
-            if col_name not in self._col_set:
-                # raw_results references a value not present in local one-hot
-                # columns — skip rather than fabricate a split direction.
-                continue
-            left_pos = by_class.get(1, 0)
-            left_neg = by_class.get(0, 0)
-            left_n = left_pos + left_neg
-            right_pos = n_pos - left_pos
-            right_neg = n_neg - left_neg
-            right_n = right_pos + right_neg
-            if left_n == 0 or right_n == 0:
-                continue
-            if _k > 0 and (0 < left_pos < _k or 0 < right_pos < _k):
-                continue
-            n_total = left_n + right_n
-            wg = (left_n / n_total) * imp_fn(left_pos, left_neg) + (right_n / n_total) * imp_fn(right_pos, right_neg)
-            g = base_imp_root - wg
-            if g > best_gain_bi:
-                best_gain_bi = g
-                best_col_name = col_name
-
-        if best_col_name is None:
-            # No usable BI split — fall back to local fit so the demo still
-            # produces a tree, but flag it on the tree dict for transparency.
-            self.fit(df, feature_columns, target_col)
-            if self.tree is not None:
-                self.tree["bi_root"] = False
-            self.train_time = time.time() - start
-            return self
-
-        best_ci = self.col_names.index(best_col_name)
-
-        # ── Step 2: apply the BI-chosen split to the local data ────────────
-        all_indices = np.arange(len(df))
-        mask = X_arr[all_indices, best_ci] == 1
-
-        # ── Step 3: build child subtrees from local data (depths 1..max) ───
-        def _build(indices: np.ndarray, depth: int) -> dict:
-            n = len(indices)
-            n_pos_node = int(y[indices].sum())
-            n_neg_node = n - n_pos_node
+        def _leaf(n_pos_node: int, n_neg_node: int) -> dict:
+            n = n_pos_node + n_neg_node
             risk = n_pos_node / max(1, n)
+            return {"type": "leaf", "risk": risk, "n_pos": n_pos_node, "n_neg": n_neg_node, "n": n}
+
+        def _build(
+            path: tuple[tuple[str, str, bool], ...],
+            depth: int,
+            n_pos_node: int,
+            n_neg_node: int,
+        ) -> dict:
+            n = n_pos_node + n_neg_node
             if depth >= _md or n == 0 or n_pos_node == 0 or n_neg_node == 0:
-                return {
-                    "type": "leaf",
-                    "risk": risk,
-                    "n_pos": n_pos_node,
-                    "n_neg": n_neg_node,
-                    "n": n,
-                }
+                return _leaf(n_pos_node, n_neg_node)
+
             base_imp = imp_fn(n_pos_node, n_neg_node)
-            best_gain, best_ci_child = 0.0, -1
-            y_sub = y[indices]
-            X_sub = X_arr[indices]
-            for ci in range(X_sub.shape[1]):
-                left_mask = X_sub[:, ci] == 1
-                left_n_c = int(left_mask.sum())
-                right_n_c = n - left_n_c
-                if left_n_c == 0 or right_n_c == 0:
+            best: tuple[float, str, str, int, str, int, int, int, int] | None = None
+
+            for feature, value, col_idx, col_name in candidates:
+                left_pos = _count(path, feature, value, 1)
+                left_neg = _count(path, feature, value, 0)
+                if left_pos < 0 or left_neg < 0:
+                    raise ValueError("count_fn returned a negative count")
+                if left_pos > n_pos_node or left_neg > n_neg_node:
+                    raise ValueError(
+                        f"count_fn returned a split count larger than the current node total for {feature}={value!r}"
+                    )
+
+                left_n = left_pos + left_neg
+                right_pos = n_pos_node - left_pos
+                right_neg = n_neg_node - left_neg
+                right_n = right_pos + right_neg
+                if left_n == 0 or right_n == 0:
                     continue
-                left_pos_c = int((left_mask & (y_sub == 1)).sum())
-                right_pos_c = n_pos_node - left_pos_c
-                if _k > 0 and (0 < left_pos_c < _k or 0 < right_pos_c < _k):
+                if _k > 0 and (0 < left_pos < _k or 0 < right_pos < _k):
                     continue
-                wg_c = (left_n_c / n) * imp_fn(left_pos_c, left_n_c - left_pos_c) + (right_n_c / n) * imp_fn(
-                    right_pos_c, n_neg_node - (left_n_c - left_pos_c)
-                )
-                g_c = base_imp - wg_c
-                if g_c > best_gain:
-                    best_gain, best_ci_child = g_c, ci
-            if best_ci_child < 0:
-                return {
-                    "type": "leaf",
-                    "risk": risk,
-                    "n_pos": n_pos_node,
-                    "n_neg": n_neg_node,
-                    "n": n,
-                }
-            mask_c = X_arr[indices, best_ci_child] == 1
+
+                weighted_imp = (left_n / n) * imp_fn(left_pos, left_neg) + (right_n / n) * imp_fn(right_pos, right_neg)
+                gain = base_imp - weighted_imp
+                if best is None or gain > best[0]:
+                    best = (gain, feature, value, col_idx, col_name, left_pos, left_neg, right_pos, right_neg)
+
+            if best is None or best[0] <= 0:
+                return _leaf(n_pos_node, n_neg_node)
+
+            _gain, feature, value, col_idx, col_name, left_pos, left_neg, right_pos, right_neg = best
+            left_path = path + ((feature, value, True),)
+            right_path = path + ((feature, value, False),)
             return {
                 "type": "split",
-                "col_idx": best_ci_child,
-                "col_name": self.col_names[best_ci_child],
-                "left": _build(indices[mask_c], depth + 1),
-                "right": _build(indices[~mask_c], depth + 1),
+                "col_idx": col_idx,
+                "col_name": col_name,
+                "left": _build(left_path, depth + 1, left_pos, left_neg),
+                "right": _build(right_path, depth + 1, right_pos, right_neg),
                 "n_pos": n_pos_node,
                 "n_neg": n_neg_node,
                 "n": n,
+                "gain": best[0],
             }
 
-        # Use BI base rates (n_pos, n_neg) on the root node's counts so the
-        # tree's reported totals reflect the encrypted dataset, not local.
-        self.tree = {
-            "type": "split",
-            "col_idx": best_ci,
-            "col_name": best_col_name,
-            "left": _build(all_indices[mask], 1),
-            "right": _build(all_indices[~mask], 1),
-            "n_pos": n_pos,
-            "n_neg": n_neg,
-            "n": n_pos + n_neg,
-            "bi_root": True,
-            "bi_root_gain": best_gain_bi,
-        }
+        self.tree = _build(tuple(), 0, int(n_pos), int(n_neg))
         self.train_time = time.time() - start
         return self
 
@@ -431,9 +863,13 @@ class DecisionTreeModel:
 
         active: set = set()
         for feat in self.feature_columns:
-            cname = f"{feat}_{row_dict.get(feat, '')}"
+            raw_value = row_dict.get(feat, "")
+            cname = f"{feat}_{raw_value}"
+            cname_norm = f"{feat}_{self._norm_value(raw_value)}"
             if cname in self._col_set:
                 active.add(cname)
+            elif cname_norm in self._col_set:
+                active.add(cname_norm)
 
         def _walk(node: dict) -> float:
             if node["type"] == "leaf":
@@ -446,6 +882,517 @@ class DecisionTreeModel:
     def predict_batch(self, df: pd.DataFrame) -> list[tuple[int, float]]:
         return [self.predict(row.to_dict()) for _, row in df.iterrows()]
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RANDOM FOREST  (ensemble of aggregate-count decision trees)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class RandomForestModel:
+    """Random forest over aggregate-count decision trees.
+
+    Each tree is a ``DecisionTreeModel`` trained through ``fit_from_counts`` on
+    a random subset of feature keys. This keeps the model generic: it depends on
+    a count provider, not on Blind Insight, DataFrames, or demo-specific fields.
+    """
+
+    def __init__(
+        self,
+        n_estimators: int = 10,
+        max_depth: int = 3,
+        criterion: str = "gini",
+        k_min: int = 0,
+        max_features: int | float | str | None = "sqrt",
+        random_state: int | None = None,
+        threshold: float = 0.5,
+    ) -> None:
+        if n_estimators < 1:
+            raise ValueError("n_estimators must be >= 1")
+        self.n_estimators = int(n_estimators)
+        self.max_depth = max_depth
+        self.criterion = criterion
+        self.k_min = k_min
+        self.max_features = max_features
+        self.random_state = random_state
+        self.threshold = threshold
+        self.estimators_: list[DecisionTreeModel] = []
+        self.feature_subsets_: list[list[str]] = []
+        self.feature_columns: list[str] = []
+        self.feature_values: dict[str, list[str]] = {}
+        self.train_time: float = 0.0
+
+    @staticmethod
+    def _norm_value(value: Any) -> str:
+        return str(value).lower()
+
+    def _resolve_max_features(self, n_features: int) -> int:
+        mf = self.max_features
+        if mf is None or mf == "all":
+            return n_features
+        if mf == "sqrt":
+            return max(1, int(math.ceil(math.sqrt(n_features))))
+        if mf == "log2":
+            return max(1, int(math.ceil(math.log2(max(2, n_features)))))
+        if isinstance(mf, float):
+            if not 0 < mf <= 1:
+                raise ValueError("float max_features must be in (0, 1]")
+            return max(1, int(math.ceil(mf * n_features)))
+        if isinstance(mf, int):
+            if mf < 1:
+                raise ValueError("integer max_features must be >= 1")
+            return min(mf, n_features)
+        raise ValueError("max_features must be None, 'all', 'sqrt', 'log2', int, or float")
+
+    def fit_from_counts(
+        self,
+        count_fn: Callable[[tuple[tuple[str, str, bool], ...], str, str, int], int],
+        feature_values: dict[str, list[str]],
+        n_pos: int,
+        n_neg: int,
+    ) -> RandomForestModel:
+        """Train an ensemble of count-backed decision trees.
+
+        Parameters match ``DecisionTreeModel.fit_from_counts``. Randomness only
+        controls feature-subset selection; all counts still come from the
+        supplied aggregate count function.
+        """
+        start = time.time()
+        if not feature_values:
+            raise ValueError("feature_values must contain at least one feature")
+
+        self.feature_columns = list(feature_values.keys())
+        self.feature_values = {
+            feature: [self._norm_value(value) for value in values] for feature, values in feature_values.items()
+        }
+        n_features = len(self.feature_columns)
+        n_subset = self._resolve_max_features(n_features)
+        rng = np.random.default_rng(self.random_state)
+        self.estimators_ = []
+        self.feature_subsets_ = []
+
+        for i in range(self.n_estimators):
+            if i == 0 and n_subset < n_features:
+                # Include one full-view tree so the ensemble remains stable on
+                # sparse categorical demos where one feature may dominate.
+                subset = list(self.feature_columns)
+            elif n_subset >= n_features:
+                subset = list(self.feature_columns)
+                rng.shuffle(subset)
+            else:
+                subset = rng.choice(self.feature_columns, size=n_subset, replace=False).tolist()
+
+            subset_values = {feature: self.feature_values[feature] for feature in subset}
+            tree = DecisionTreeModel(
+                max_depth=self.max_depth,
+                criterion=self.criterion,
+                k_min=self.k_min,
+            ).fit_from_counts(
+                count_fn=count_fn,
+                feature_values=subset_values,
+                n_pos=n_pos,
+                n_neg=n_neg,
+            )
+            self.estimators_.append(tree)
+            self.feature_subsets_.append(subset)
+
+        self.train_time = time.time() - start
+        return self
+
+    def predict(self, row_features: dict[str, Any]) -> tuple[int, float]:
+        """Return ``(predicted_class, mean_tree_risk)``."""
+        if not self.estimators_:
+            return 0, 0.0
+        risks = [tree.predict(row_features)[1] for tree in self.estimators_]
+        risk = float(sum(risks) / len(risks))
+        return (1 if risk >= self.threshold else 0), risk
+
+    def predict_batch(self, df: pd.DataFrame) -> list[tuple[int, float]]:
+        return [self.predict(row.to_dict()) for _, row in df.iterrows()]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ADABOOST  (aggregate-count decision stumps)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class AdaBoostStumpModel:
+    """AdaBoost over one-hot categorical decision stumps from aggregate counts.
+
+    The model is generic: ``fit_from_counts`` only needs class totals, candidate
+    feature values, and a count provider with the same contract as
+    ``DecisionTreeModel.fit_from_counts``. Sample weights are represented as
+    class-specific multipliers over regions induced by the stumps already
+    selected, so no row-level data is required.
+    """
+
+    def __init__(
+        self,
+        n_estimators: int = 10,
+        learning_rate: float = 1.0,
+        k_min: int = 0,
+        threshold: float = 0.5,
+    ) -> None:
+        if n_estimators < 1:
+            raise ValueError("n_estimators must be >= 1")
+        if learning_rate <= 0:
+            raise ValueError("learning_rate must be > 0")
+        self.n_estimators = int(n_estimators)
+        self.learning_rate = float(learning_rate)
+        self.k_min = int(k_min)
+        self.threshold = float(threshold)
+        self.stumps_: list[dict[str, Any]] = []
+        self.feature_columns: list[str] = []
+        self.feature_values: dict[str, list[str]] = {}
+        self.col_names: list[str] = []
+        self._col_set: set[str] = set()
+        self.train_time: float = 0.0
+
+    @staticmethod
+    def _norm_value(value: Any) -> str:
+        return str(value).lower()
+
+    def fit_from_counts(
+        self,
+        count_fn: Callable[[tuple[tuple[str, str, bool], ...], str, str, int], int],
+        feature_values: dict[str, list[str]],
+        n_pos: int,
+        n_neg: int,
+    ) -> AdaBoostStumpModel:
+        """Train weighted decision stumps from aggregate conditional counts."""
+        start = time.time()
+        if not feature_values:
+            raise ValueError("feature_values must contain at least one feature")
+        if n_pos < 0 or n_neg < 0:
+            raise ValueError("class totals must be non-negative")
+        n_total = int(n_pos) + int(n_neg)
+        if n_total <= 0:
+            raise ValueError("class totals must be non-zero")
+
+        self.feature_columns = list(feature_values.keys())
+        self.feature_values = {}
+        candidates: list[tuple[str, str, int, str]] = []
+        self.col_names = []
+        for feature in self.feature_columns:
+            seen: set[str] = set()
+            self.feature_values[feature] = []
+            for raw_value in feature_values[feature]:
+                value = self._norm_value(raw_value)
+                if value in seen:
+                    continue
+                seen.add(value)
+                self.feature_values[feature].append(value)
+                col_name = f"{feature}_{value}"
+                candidates.append((feature, value, len(self.col_names), col_name))
+                self.col_names.append(col_name)
+        self._col_set = set(self.col_names)
+        self.stumps_ = []
+
+        count_cache: dict[tuple[tuple[tuple[str, str, bool], ...], str, str, int], int] = {}
+
+        def _count(
+            path: tuple[tuple[str, str, bool], ...],
+            feature: str,
+            value: str,
+            cls: int,
+        ) -> int:
+            key = (path, feature, value, int(cls))
+            if key not in count_cache:
+                count_cache[key] = int(count_fn(path, feature, value, int(cls)))
+            return count_cache[key]
+
+        regions: list[dict[str, Any]] = [
+            {
+                "path": tuple(),
+                "n_pos": int(n_pos),
+                "n_neg": int(n_neg),
+                "w_pos": 1.0 / n_total,
+                "w_neg": 1.0 / n_total,
+            }
+        ]
+        used_candidates: set[tuple[str, str]] = set()
+        eps = 1e-12
+
+        for _round_idx in range(self.n_estimators):
+            best: dict[str, Any] | None = None
+            total_weight = sum(r["n_pos"] * r["w_pos"] + r["n_neg"] * r["w_neg"] for r in regions)
+            if total_weight <= eps:
+                break
+
+            for feature, value, col_idx, col_name in candidates:
+                if (feature, value) in used_candidates:
+                    continue
+
+                details: list[tuple[dict[str, Any], int, int, int, int]] = []
+                left_pos_w = left_neg_w = right_pos_w = right_neg_w = 0.0
+                left_pos_raw = left_neg_raw = right_pos_raw = right_neg_raw = 0
+
+                for region in regions:
+                    path = region["path"]
+                    left_pos = _count(path, feature, value, 1)
+                    left_neg = _count(path, feature, value, 0)
+                    if left_pos < 0 or left_neg < 0:
+                        raise ValueError("count_fn returned a negative count")
+                    if left_pos > region["n_pos"] or left_neg > region["n_neg"]:
+                        raise ValueError(
+                            "count_fn returned a split count larger than the current region total "
+                            f"for {feature}={value!r}"
+                        )
+
+                    right_pos = region["n_pos"] - left_pos
+                    right_neg = region["n_neg"] - left_neg
+                    details.append((region, left_pos, left_neg, right_pos, right_neg))
+
+                    left_pos_raw += left_pos
+                    left_neg_raw += left_neg
+                    right_pos_raw += right_pos
+                    right_neg_raw += right_neg
+                    left_pos_w += region["w_pos"] * left_pos
+                    left_neg_w += region["w_neg"] * left_neg
+                    right_pos_w += region["w_pos"] * right_pos
+                    right_neg_w += region["w_neg"] * right_neg
+
+                left_n = left_pos_raw + left_neg_raw
+                right_n = right_pos_raw + right_neg_raw
+                if left_n == 0 or right_n == 0:
+                    continue
+                if self.k_min > 0 and (0 < left_pos_raw < self.k_min or 0 < right_pos_raw < self.k_min):
+                    continue
+
+                left_pred = 1 if left_pos_w >= left_neg_w else 0
+                right_pred = 1 if right_pos_w >= right_neg_w else 0
+                if left_pred == right_pred:
+                    continue
+
+                error = (left_neg_w if left_pred == 1 else left_pos_w) + (
+                    right_neg_w if right_pred == 1 else right_pos_w
+                )
+                error /= total_weight
+                if best is None or error < best["error"]:
+                    best = {
+                        "feature": feature,
+                        "value": value,
+                        "col_idx": col_idx,
+                        "col_name": col_name,
+                        "left_pred": left_pred,
+                        "right_pred": right_pred,
+                        "left_risk": left_pos_raw / max(1, left_n),
+                        "right_risk": right_pos_raw / max(1, right_n),
+                        "left_n": left_n,
+                        "right_n": right_n,
+                        "left_pos": left_pos_raw,
+                        "left_neg": left_neg_raw,
+                        "right_pos": right_pos_raw,
+                        "right_neg": right_neg_raw,
+                        "error": float(error),
+                        "details": details,
+                    }
+
+            if best is None or best["error"] >= 0.5:
+                break
+
+            raw_error = best["error"]
+            clipped_error = min(max(raw_error, eps), 1.0 - eps)
+            alpha = self.learning_rate * 0.5 * math.log((1.0 - clipped_error) / clipped_error)
+            stump = {k: v for k, v in best.items() if k != "details"}
+            stump["alpha"] = float(alpha)
+            self.stumps_.append(stump)
+            used_candidates.add((best["feature"], best["value"]))
+
+            new_regions: list[dict[str, Any]] = []
+            for region, left_pos, left_neg, right_pos, right_neg in best["details"]:
+                for branch, pred, pos_count, neg_count in (
+                    (True, best["left_pred"], left_pos, left_neg),
+                    (False, best["right_pred"], right_pos, right_neg),
+                ):
+                    if pos_count + neg_count == 0:
+                        continue
+                    pos_factor = math.exp(-alpha) if pred == 1 else math.exp(alpha)
+                    neg_factor = math.exp(-alpha) if pred == 0 else math.exp(alpha)
+                    new_regions.append(
+                        {
+                            "path": region["path"] + ((best["feature"], best["value"], branch),),
+                            "n_pos": pos_count,
+                            "n_neg": neg_count,
+                            "w_pos": region["w_pos"] * pos_factor,
+                            "w_neg": region["w_neg"] * neg_factor,
+                        }
+                    )
+
+            norm = sum(r["n_pos"] * r["w_pos"] + r["n_neg"] * r["w_neg"] for r in new_regions)
+            if norm <= eps:
+                break
+            for region in new_regions:
+                region["w_pos"] /= norm
+                region["w_neg"] /= norm
+            regions = new_regions
+
+            if raw_error <= eps:
+                break
+
+        self.train_time = time.time() - start
+        return self
+
+    def predict(self, row_features: dict[str, Any]) -> tuple[int, float]:
+        """Return ``(predicted_class, boosted_risk)`` for one row."""
+        if not self.stumps_:
+            return 0, 0.0
+
+        active: set[str] = set()
+        for feature in self.feature_columns:
+            raw_value = row_features.get(feature, "")
+            cname = f"{feature}_{raw_value}"
+            cname_norm = f"{feature}_{self._norm_value(raw_value)}"
+            if cname in self._col_set:
+                active.add(cname)
+            elif cname_norm in self._col_set:
+                active.add(cname_norm)
+
+        score = 0.0
+        for stump in self.stumps_:
+            pred = stump["left_pred"] if stump["col_name"] in active else stump["right_pred"]
+            score += stump["alpha"] * (1.0 if pred == 1 else -1.0)
+
+        margin = 2.0 * score
+        if margin >= 0:
+            risk = 1.0 / (1.0 + math.exp(-margin))
+        else:
+            exp_margin = math.exp(margin)
+            risk = exp_margin / (1.0 + exp_margin)
+        return (1 if risk >= self.threshold else 0), float(risk)
+
+    def predict_batch(self, df: pd.DataFrame) -> list[tuple[int, float]]:
+        return [self.predict(row.to_dict()) for _, row in df.iterrows()]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HISTOGRAM CLASSIFIER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class HistogramClassifierModel:
+    """Categorical histogram classifier trained from aggregate marginal counts.
+
+    The model stores one posterior risk bucket per ``feature=value``:
+    ``P(positive | feature=value)``.  Prediction averages the bucket risks for
+    the row's observed feature values.  Unlike Naive Bayes, this does not
+    multiply conditionals or assume feature independence; each feature casts a
+    direct risk vote from its encrypted count histogram.
+    """
+
+    def __init__(
+        self,
+        alpha: float = 1.0,
+        threshold: float | None = None,
+        use_feature_weights: bool = True,
+    ) -> None:
+        self.alpha = alpha
+        self.threshold = threshold
+        self.use_feature_weights = use_feature_weights
+        self.P_pos: float = 0.5
+        self.P_neg: float = 0.5
+        self.histograms: dict[str, dict[str, dict[str, float]]] = {}
+        self.feature_keys: list[str] = []
+        self.feature_weights: dict[str, float] = {}
+        self.train_time: float = 0.0
+
+    def fit(
+        self,
+        marginal_counts: list[tuple[str, int, str, int]],
+        n_pos: int,
+        n_neg: int,
+        feature_values: dict[str, list[str]] | None = None,
+    ) -> HistogramClassifierModel:
+        """Fit lookup histograms from class-split aggregate counts.
+
+        Parameters
+        ----------
+        marginal_counts : list of (feature_key, class_label, value, count)
+        n_pos, n_neg : class totals
+        feature_values : optional {feature_key: [values]} so zero-count buckets
+                         can still receive smoothed probabilities.
+        """
+        start = time.time()
+        n_total = n_pos + n_neg
+        self.P_pos = n_pos / n_total if n_total > 0 else 0.5
+        self.P_neg = n_neg / n_total if n_total > 0 else 0.5
+
+        counts: dict[str, dict[str, dict[int, int]]] = {}
+        for feature_key, class_label, raw_value, count in marginal_counts:
+            value = str(raw_value).lower()
+            class_counts = counts.setdefault(feature_key, {}).setdefault(value, {1: 0, 0: 0})
+            class_counts[int(class_label)] = class_counts.get(int(class_label), 0) + int(count)
+
+        if feature_values:
+            for feature_key in counts:
+                for raw_value in feature_values.get(feature_key, []):
+                    value = str(raw_value).lower()
+                    counts[feature_key].setdefault(value, {1: 0, 0: 0})
+
+        self.feature_keys = sorted(counts.keys())
+        self.histograms = {feature_key: {} for feature_key in self.feature_keys}
+        self.feature_weights = {}
+
+        for feature_key in self.feature_keys:
+            feature_support = sum(
+                class_counts.get(1, 0) + class_counts.get(0, 0) for class_counts in counts[feature_key].values()
+            )
+            weighted_discrimination = 0.0
+
+            for value, class_counts in counts[feature_key].items():
+                pos_count = class_counts.get(1, 0)
+                neg_count = class_counts.get(0, 0)
+                support = pos_count + neg_count
+                risk = (pos_count + self.alpha) / (support + 2.0 * self.alpha)
+                self.histograms[feature_key][value] = {
+                    "risk": risk,
+                    "support": float(support),
+                    "n_pos": float(pos_count),
+                    "n_neg": float(neg_count),
+                }
+                if feature_support > 0:
+                    weighted_discrimination += (support / feature_support) * abs(risk - self.P_pos)
+
+            if self.use_feature_weights:
+                self.feature_weights[feature_key] = 1.0 + weighted_discrimination
+            else:
+                self.feature_weights[feature_key] = 1.0
+
+        if self.threshold is None:
+            self.threshold = self.P_pos
+
+        self.train_time = time.time() - start
+        return self
+
+    def predict(self, row_features: dict[str, str]) -> tuple[int, float]:
+        """Return (predicted_class, averaged_histogram_risk)."""
+        weighted_risk = 0.0
+        total_weight = 0.0
+
+        for feature_key in self.feature_keys:
+            value = str(row_features.get(feature_key, "")).lower()
+            bucket = self.histograms.get(feature_key, {}).get(value)
+            risk = bucket["risk"] if bucket else self.P_pos
+            weight = self.feature_weights.get(feature_key, 1.0)
+            weighted_risk += weight * risk
+            total_weight += weight
+
+        risk = weighted_risk / total_weight if total_weight > 0 else self.P_pos
+        threshold = self.threshold if self.threshold is not None else self.P_pos
+        pred = 1 if risk >= threshold else 0
+        return pred, risk
+
+    def predict_class(self, row_features: dict[str, str]) -> int:
+        return self.predict(row_features)[0]
+
+    def predict_risk(self, row_features: dict[str, str]) -> float:
+        return self.predict(row_features)[1]
+
+    def feature_importance(self) -> list[tuple[str, float]]:
+        """Return features ordered by histogram discrimination weight."""
+        return sorted(self.feature_weights.items(), key=lambda item: item[1], reverse=True)
+
+
+HistogramClassifier = HistogramClassifierModel
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # LOGISTIC REGRESSION  (OLS from aggregate counts + optional IRLS refinement)
@@ -778,3 +1725,49 @@ def apply_platt(risk: float, a: float, b: float) -> float:
     """Apply Platt scaling to a single risk score."""
     z = max(-500, min(500, a * risk + b))
     return 1.0 / (1.0 + math.exp(-z))
+
+
+def build_bayesian_cpt_counts_local(
+    df: pd.DataFrame,
+    target_col: str,
+    feature_values: dict[str, list[str]],
+    parent_map: dict[str, list[str]] | None = None,
+    col_map: dict[str, str] | None = None,
+) -> list[tuple[str, int, tuple[tuple[str, str], ...], str, int]]:
+    """Build Bayesian-network CPT counts from a local categorical DataFrame.
+
+    Returns ``(feature_key, class_label, parent_state, value, count)`` tuples
+    compatible with ``BayesianNetworkClassifierModel.fit``.  The output includes
+    explicit zero-count CPT cells so plaintext and encrypted aggregate workflows
+    have the same table shape.
+    """
+    parent_map = {feature: list(parents) for feature, parents in (parent_map or {}).items()}
+    col_map = col_map or {}
+    values = {
+        feature: [str(value).lower() for value in feature_possible_values]
+        for feature, feature_possible_values in feature_values.items()
+    }
+
+    working = df.copy()
+    for feature in values:
+        column = col_map.get(feature, feature)
+        working[column] = working[column].astype(str).str.lower()
+    working[target_col] = working[target_col].astype(int)
+
+    results: list[tuple[str, int, tuple[tuple[str, str], ...], str, int]] = []
+    for feature, feature_possible_values in values.items():
+        parents = parent_map.get(feature, [])
+        feature_column = col_map.get(feature, feature)
+        group_columns = [target_col, *(col_map.get(parent, parent) for parent in parents), feature_column]
+        grouped = working.groupby(group_columns, dropna=False).size().to_dict()
+        parent_value_lists = [values[parent] for parent in parents]
+        parent_combos = list(product(*parent_value_lists)) if parent_value_lists else [tuple()]
+
+        for class_label in (1, 0):
+            for parent_combo in parent_combos:
+                parent_state = tuple((parent, parent_value) for parent, parent_value in zip(parents, parent_combo))
+                for value in feature_possible_values:
+                    group_key = (class_label, *parent_combo, value)
+                    count = int(grouped.get(group_key, 0))
+                    results.append((feature, class_label, parent_state, value, count))
+    return results
